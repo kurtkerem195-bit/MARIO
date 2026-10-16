@@ -1,0 +1,3196 @@
+"""Mini Mario v4 - Python 3.13, harici kitaplık YOK (sadece standart kütüphane).
+
+Çalıştır:  python mario.py
+
+Kontroller (tek oyuncu)
+  Sol/Sağ ya da A/D   : yürü           Shift / X / Z : koş
+  Boşluk / Yukarı / W : zıpla (havada tekrar bas = çift zıplama)
+Kontroller (2 oyuncu)
+  1. oyuncu: A / D yürü, W (ya da Boşluk) zıpla, Sol Shift koş
+  2. oyuncu: ◀ / ▶ yürü, ▲ zıpla, Sağ Shift (ya da Sağ Ctrl) koş
+Genel
+  P  : duraklat (menüde: 1 / 2 oyuncu)       S : ayarlar (menü / duraklatma)
+  F11: tam ekran aç / kapat (Ayarlar'da da var)
+  K  : Mario'yu özelleştir (TAB = oyuncu 1 / 2)    M : sesi aç / kapat
+  R  : bölümü yeniden başlat                 ESC : ana menü
+
+Oyun
+  * "?" kutularına kafanla vur -> hediye XP çıkar; XP ile şapka, tulum, BOT rengi
+    ve aksesuar (aynı anda 2 tane) satın al.
+  * 7 bölüm, 9 canavar türü (her birinin kendi sesi var).
+  * Ayarlar: ses, ses seviyesi, ses motoru (+ test), zorluk, oyuncu sayısı.
+  * İlerleme mario_save.json dosyasına kaydedilir. Sesler kodla üretilir ve
+    yanındaki "sesler" klasörüne .wav olarak yazılır (çift tıklayıp deneyebilirsin).
+"""
+import array
+import atexit
+import ctypes
+import json
+import math
+import os
+import queue
+import random
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tkinter as tk
+import wave
+
+try:
+    import winsound            # sadece Windows'ta var
+except ImportError:
+    winsound = None
+
+# ---------------------------------------------------------------- Ayarlar
+TILE = 40
+W, H = 800, 480
+ROWS = 12
+FRAME_MS = 16          # ~60 FPS
+STEP = 1 / 60          # oyun mantığı adımı (saniye)
+GRAVITY = 0.6          # yükselirken
+FALL_GRAVITY = 0.8     # düşerken (daha tok his)
+MAX_FALL = 14
+WALK = 4.0
+RUN = 4.2
+ACCEL = 0.55           # yerde hızlanma
+AIR_ACCEL = 0.38       # havada hızlanma
+FRICTION = 0.6         # yerde yavaşlama
+AIR_FRICTION = 0.1
+JUMP = -13.2
+DOUBLE_JUMP = -11.6    # havadaki ikinci zıplama
+MAX_AIR_JUMPS = 1      # havada kaç ekstra zıplama (1 = çift zıplama)
+COYOTE = 6             # kenardan ayrıldıktan sonra hâlâ zıplayabilme (kare)
+JUMP_BUFFER = 7        # yere inmeden az önce basılan zıplama tuşunu hatırla
+BUMP_FRAMES = 12
+GRASS_PAD = 6          # çim telleri için tile'ın üstüne taşan piksel
+SOLID = set("#BSU?T")  # içinden geçilemeyen blok türleri
+MAX_SEP = W - 160      # 2 oyuncu: oyuncular arası azami yatay mesafe
+UNSTOMPABLE = {"spiky", "plant", "ghost", "lavaball"}   # üstüne basılamayanlar
+ENEMY_NAMES = {"walker": "Sülük", "spiky": "Dikenli", "hopper": "Kurbağa", "flyer": "Yarasa",
+               "penguin": "Penguen", "plant": "Etobur Bitki", "ghost": "Hayalet",
+               "lavaball": "Lav Topu", "bomb": "Bomba"}
+
+ENTER_KEYS = {"return", "kp_enter"}
+KEYS_SOLO = dict(left={"left", "a"}, right={"right", "d"},
+                 jump={"space", "up", "w"}, run={"shift_l", "shift_r", "x", "z"})
+KEYS_P1 = dict(left={"a"}, right={"d"}, jump={"w", "space"}, run={"shift_l", "z"})
+KEYS_P2 = dict(left={"left"}, right={"right"}, jump={"up"},
+               run={"shift_r", "control_r", "slash"})
+
+DIFFICULTIES = [
+    dict(name="Kolay", lives=5, speed=0.8, invuln=150, xp=1.0),
+    dict(name="Normal", lives=3, speed=1.0, invuln=90, xp=1.0),
+    dict(name="Zor", lives=2, speed=1.3, invuln=60, xp=1.5),
+]
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+SAVE_FILE = os.path.join(_HERE, "mario_save.json")
+SOUND_DIR = os.path.join(_HERE, "sesler")
+
+# ---------------------------------------------------------------- Temalar
+THEMES = {
+    "gunduz": dict(sky="#5c94fc", ground="#b8601f", top="#3fc83f", top_edge="#1d7a1d",
+                   brick="#c8742c", stone="#d2a56a", pipe="#2cb52c", deco="hills"),
+    "magara": dict(sky="#0e0e24", ground="#52526e", top="#8a8ac0", top_edge="#4a4a80",
+                   brick="#62628e", stone="#7a7aa8", pipe="#2cb52c", deco="cave"),
+    "kale": dict(sky="#240808", ground="#74403a", top="#c06a58", top_edge="#702a24",
+                 brick="#8a5642", stone="#a45f4c", pipe="#2cb52c", deco="lava",
+                 pillar="#3a1212"),
+    "kar": dict(sky="#9fd0ff", ground="#7b6a5a", top="#f2fbff", top_edge="#9cc4e4",
+                brick="#8ccdee", stone="#b9d9ee", pipe="#35a8d6", deco="snow"),
+    "col": dict(sky="#f6c667", ground="#c89a52", top="#ead08a", top_edge="#a8782c",
+                brick="#d28c4a", stone="#e0b878", pipe="#6aa030", deco="desert"),
+    "hayalet": dict(sky="#150f26", ground="#3e3258", top="#6a5a9a", top_edge="#2a1f44",
+                    brick="#4a3c70", stone="#5c4e86", pipe="#3a9a6a", deco="haunted"),
+    "volkan": dict(sky="#3a0c06", ground="#4a3030", top="#e0642a", top_edge="#8a2a10",
+                   brick="#6a4038", stone="#8a5a4a", pipe="#3a9a3a", deco="lava",
+                   pillar="#5a1a0c"),
+}
+
+# ---------------------------------------------------------------- Bölümler
+# bricks: (satır, ilk_sütun, son_sütun)   qs: (satır, sütun)   pipes: (sütun, yükseklik)
+# enemies: (tür, sütun) ya da (tür, sütun, satır) -> uçanlar/hayaletler için satır
+# checks: kontrol noktası sütunları (oyun en yakın uygun zemine kaydırır)
+LEVELS = [
+    dict(
+        name="1-1  Yeşil Vadi", theme="gunduz", cols=100,
+        gaps=[(24, 26), (46, 48), (70, 72), (80, 82)],
+        bricks=[(7, 12, 16), (4, 18, 21), (7, 40, 43), (7, 60, 64), (4, 66, 69)],
+        qs=[(7, 14), (7, 16), (4, 19), (7, 41), (7, 43), (7, 62), (4, 67)],
+        pipes=[(30, 2), (36, 3), (56, 2)],
+        stairs=88,
+        extra_coins=[(8, 8, 10)],
+        enemies=[("walker", 8), ("walker", 20), ("walker", 33), ("walker", 40),
+                 ("walker", 52), ("spiky", 58), ("hopper", 63), ("walker", 76),
+                 ("spiky", 85)],
+        checks=[44, 74],
+    ),
+    dict(
+        name="1-2  Karanlık Mağara", theme="magara", cols=110,
+        gaps=[(14, 16), (32, 34), (50, 52), (62, 64), (84, 86), (95, 97)],
+        bricks=[(7, 18, 22), (4, 24, 27), (7, 38, 42), (4, 44, 47), (7, 54, 58),
+                (4, 60, 63), (7, 70, 74), (4, 76, 79), (7, 88, 92), (4, 93, 96)],
+        qs=[(7, 19), (4, 25), (7, 40), (4, 45), (7, 56), (7, 72), (4, 77), (7, 90)],
+        pipes=[(28, 2), (44, 3), (66, 2), (80, 3)],
+        stairs=100,
+        enemies=[("walker", 6), ("spiky", 20), ("flyer", 30, 6), ("walker", 36),
+                 ("hopper", 40), ("plant", 44), ("spiky", 48), ("flyer", 54, 6),
+                 ("walker", 60), ("spiky", 72), ("hopper", 76), ("flyer", 78, 5),
+                 ("plant", 80), ("walker", 83), ("spiky", 90), ("hopper", 98)],
+        checks=[37, 69],
+    ),
+    dict(
+        name="1-3  Lav Kalesi", theme="kale", cols=120,
+        gaps=[(12, 14), (26, 28), (40, 42), (52, 54), (70, 72), (84, 86), (100, 102)],
+        bricks=[(7, 16, 20), (4, 22, 25), (7, 32, 36), (7, 44, 47), (4, 48, 51),
+                (7, 56, 60), (4, 62, 65), (7, 74, 78), (4, 80, 83), (7, 90, 94),
+                (4, 95, 98)],
+        qs=[(7, 18), (4, 23), (7, 34), (7, 45), (4, 49), (7, 58), (4, 63),
+            (7, 76), (4, 81), (7, 92)],
+        pipes=[(30, 3), (38, 3), (66, 3), (88, 3)],
+        stairs=106,
+        enemies=[("walker", 7), ("spiky", 18), ("hopper", 24), ("lavaball", 27),
+                 ("flyer", 32, 6), ("plant", 30), ("walker", 36), ("spiky", 44),
+                 ("hopper", 48), ("lavaball", 53), ("flyer", 54, 6), ("spiky", 58),
+                 ("walker", 62), ("plant", 66), ("flyer", 68, 5), ("hopper", 73),
+                 ("spiky", 76), ("walker", 80), ("lavaball", 85), ("flyer", 84, 6),
+                 ("spiky", 92), ("hopper", 96), ("walker", 104), ("spiky", 113)],
+        checks=[46, 78],
+    ),
+    dict(
+        name="2-1  Kar Dağı", theme="kar", cols=110,
+        gaps=[(16, 18), (34, 36), (52, 54), (72, 74), (90, 92)],
+        bricks=[(7, 10, 14), (7, 20, 24), (4, 26, 29), (7, 40, 44), (4, 46, 49),
+                (7, 58, 62), (7, 64, 68), (7, 70, 74), (4, 76, 79), (7, 82, 86),
+                (7, 88, 92), (4, 94, 97)],
+        qs=[(7, 12), (7, 22), (4, 27), (7, 42), (4, 47), (7, 66), (7, 71),
+            (4, 77), (7, 89)],
+        pipes=[(30, 2), (38, 3), (56, 3), (80, 3)],
+        stairs=98,
+        enemies=[("penguin", 8), ("penguin", 20), ("walker", 32), ("plant", 38),
+                 ("penguin", 47), ("spiky", 50), ("flyer", 58, 5), ("penguin", 62),
+                 ("flyer", 70, 4), ("hopper", 76), ("plant", 80), ("penguin", 86),
+                 ("walker", 94), ("spiky", 96)],
+        checks=[46, 78],
+    ),
+    dict(
+        name="2-2  Çöl Harabeleri", theme="col", cols=120,
+        gaps=[(14, 16), (30, 32), (46, 48), (60, 62), (78, 80), (96, 98)],
+        bricks=[(7, 18, 22), (4, 24, 27), (7, 36, 40), (4, 42, 45), (7, 52, 56),
+                (7, 64, 68), (4, 70, 73), (7, 84, 88), (4, 90, 93), (7, 100, 104)],
+        qs=[(7, 20), (4, 25), (7, 38), (4, 43), (7, 54), (7, 66), (4, 71),
+            (7, 86), (4, 91), (7, 102)],
+        pipes=[(26, 2), (50, 3), (58, 3), (74, 2)],
+        stairs=108,
+        enemies=[("walker", 7), ("bomb", 11), ("spiky", 20), ("bomb", 34),
+                 ("hopper", 39), ("walker", 44), ("plant", 50), ("bomb", 54),
+                 ("spiky", 66), ("hopper", 69), ("plant", 74), ("flyer", 82, 5),
+                 ("bomb", 86), ("spiky", 94), ("walker", 101), ("bomb", 105)],
+        checks=[41, 88],
+    ),
+    dict(
+        name="2-3  Hayalet Konağı", theme="hayalet", cols=120,
+        gaps=[(12, 14), (28, 30), (44, 46), (58, 60), (74, 76), (92, 94)],
+        bricks=[(7, 16, 20), (4, 22, 25), (7, 32, 36), (4, 38, 41), (7, 48, 52),
+                (4, 54, 57), (7, 62, 66), (7, 68, 72), (7, 74, 77), (4, 78, 81),
+                (7, 84, 88), (7, 90, 94), (4, 96, 99), (7, 102, 106)],
+        qs=[(7, 18), (4, 23), (7, 34), (4, 39), (7, 50), (7, 64), (4, 79),
+            (7, 86), (4, 97)],
+        pipes=[(24, 2), (42, 3), (54, 3), (80, 3), (100, 3)],
+        stairs=108,
+        enemies=[("walker", 7), ("ghost", 18, 5), ("spiky", 20), ("ghost", 30, 4),
+                 ("walker", 34), ("hopper", 38), ("plant", 42), ("spiky", 50),
+                 ("ghost", 52, 6), ("walker", 56), ("hopper", 64), ("ghost", 66, 5),
+                 ("walker", 70), ("plant", 80), ("ghost", 84, 4), ("spiky", 88),
+                 ("hopper", 98), ("walker", 104), ("ghost", 106, 5)],
+        checks=[39, 85],
+    ),
+    dict(
+        name="2-4  Lav Dünyası", theme="volkan", cols=130,
+        gaps=[(12, 14), (24, 26), (36, 38), (48, 50), (60, 62), (72, 74),
+              (84, 86), (96, 98), (108, 110)],
+        bricks=[(7, 16, 19), (4, 21, 24), (7, 28, 31), (4, 33, 36), (7, 40, 44),
+                (4, 45, 47), (7, 52, 55), (4, 56, 59), (7, 64, 67), (4, 68, 71),
+                (7, 76, 79), (4, 80, 83), (7, 88, 91), (4, 92, 95), (7, 100, 103),
+                (4, 104, 107), (7, 112, 116)],
+        qs=[(7, 17), (4, 22), (7, 29), (4, 34), (7, 42), (4, 57), (7, 65),
+            (4, 81), (7, 89), (4, 105)],
+        pipes=[(20, 3), (32, 3), (56, 3), (68, 3), (80, 3), (104, 3)],
+        stairs=118,
+        enemies=[("walker", 8), ("spiky", 18), ("plant", 20), ("lavaball", 25),
+                 ("bomb", 30), ("plant", 32), ("hopper", 34), ("spiky", 42),
+                 ("bomb", 46), ("lavaball", 49), ("flyer", 54, 6), ("plant", 56),
+                 ("lavaball", 61), ("ghost", 66, 5), ("walker", 70),
+                 ("lavaball", 73), ("hopper", 75), ("plant", 80), ("lavaball", 85),
+                 ("spiky", 90), ("bomb", 94), ("lavaball", 97), ("flyer", 100, 5),
+                 ("plant", 104), ("lavaball", 109), ("walker", 113), ("spiky", 116)],
+        checks=[40, 90],
+    ),
+]
+
+# ---------------------------------------------------------------- Özelleştirme
+# (id, ad, renk, fiyat)
+HATS = [("red", "Kırmızı", "#e02020", 0), ("blue", "Mavi", "#2a50e0", 40),
+        ("green", "Yeşil", "#20a020", 40), ("purple", "Mor", "#8a30d0", 60),
+        ("pink", "Pembe", "#f060b0", 60), ("gold", "Altın", "#e0a800", 100)]
+OVERALLS = [("blue", "Mavi", "#2040e0", 0), ("red", "Kırmızı", "#d02020", 40),
+            ("green", "Yeşil", "#209030", 40), ("black", "Siyah", "#222222", 60),
+            ("orange", "Turuncu", "#f07000", 60), ("white", "Beyaz", "#f0f0f0", 80)]
+BOOTS = [("brown", "Kahverengi", "#6b3a10", 0), ("black", "Siyah", "#1a1a1a", 30),
+         ("white", "Beyaz", "#f2f2f2", 40), ("red", "Kırmızı", "#d02020", 50),
+         ("blue", "Mavi", "#2a50e0", 50), ("gold", "Altın", "#e0b020", 120)]
+ACCS = [("mustache", "Bıyık", "", 50), ("shades", "Gözlük", "", 100),
+        ("bowtie", "Papyon", "", 70), ("cape", "Pelerin", "", 150),
+        ("crown", "Taç", "", 200)]
+MAX_ACC = 2
+CATS = [("hat", "ŞAPKA & GÖMLEK", HATS),
+        ("overall", "TULUM", OVERALLS),
+        ("boots", "BOT RENGİ", BOOTS),
+        ("acc", f"AKSESUAR  (aynı anda en fazla {MAX_ACC})", ACCS)]
+HAT_COLORS = {o[0]: o[2] for o in HATS}
+OVERALL_COLORS = {o[0]: o[2] for o in OVERALLS}
+BOOT_COLORS = {o[0]: o[2] for o in BOOTS}
+ACC_IDS = [o[0] for o in ACCS]
+AUDIO_VERSION = 4
+DEFAULT_OWNED = ["hat:red", "overall:blue", "boots:brown", "hat:green"]
+DEFAULT_SETTINGS = {"sound": True, "volume": 80, "engine": "auto",
+                    "difficulty": 1, "players": 1, "sound_ok": False,
+                    "fullscreen": False, "fs_crisp": False}
+
+
+def default_eq(idx):
+    return {"hat": "red" if idx == 0 else "green", "overall": "blue",
+            "boots": "brown", "acc": []}
+
+
+def resolve_look(eq):
+    return {"hat": HAT_COLORS[eq["hat"]],
+            "overall": OVERALL_COLORS[eq["overall"]],
+            "boots": BOOT_COLORS[eq["boots"]],
+            "acc": list(eq["acc"])}
+
+
+# ---------------------------------------------------------------- Kayıt
+def _clean_eq(raw, idx):
+    eq = default_eq(idx)
+    if isinstance(raw, dict):
+        if raw.get("hat") in HAT_COLORS:
+            eq["hat"] = raw["hat"]
+        if raw.get("overall") in OVERALL_COLORS:
+            eq["overall"] = raw["overall"]
+        if raw.get("boots") in BOOT_COLORS:
+            eq["boots"] = raw["boots"]
+        acc = raw.get("acc", [])
+        if isinstance(acc, str):            # eski kayıt biçimi
+            acc = [] if acc == "none" else [acc]
+        if isinstance(acc, list):
+            eq["acc"] = [a for a in acc if a in ACC_IDS][:MAX_ACC]
+    return eq
+
+
+def load_save():
+    data = {"xp": 0, "owned": list(DEFAULT_OWNED),
+            "equipped": default_eq(0), "equipped2": default_eq(1),
+            "settings": dict(DEFAULT_SETTINGS)}
+    try:
+        with open(SAVE_FILE, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if not isinstance(loaded, dict):
+            raise ValueError
+        if isinstance(loaded.get("xp"), int):
+            data["xp"] = loaded["xp"]
+        if isinstance(loaded.get("owned"), list):
+            data["owned"] = [str(o) for o in loaded["owned"]]
+        data["equipped"] = _clean_eq(loaded.get("equipped"), 0)
+        data["equipped2"] = _clean_eq(loaded.get("equipped2"), 1)
+        st = loaded.get("settings")
+        if isinstance(st, dict):
+            if isinstance(st.get("sound"), bool):
+                data["settings"]["sound"] = st["sound"]
+            if isinstance(st.get("volume"), int):
+                data["settings"]["volume"] = max(0, min(100, st["volume"]))
+            if isinstance(st.get("engine"), str):
+                data["settings"]["engine"] = st["engine"]
+            if st.get("difficulty") in (0, 1, 2):
+                data["settings"]["difficulty"] = st["difficulty"]
+            if st.get("players") in (1, 2):
+                data["settings"]["players"] = st["players"]
+            if isinstance(st.get("sound_ok"), bool):
+                data["settings"]["sound_ok"] = st["sound_ok"]
+            if isinstance(st.get("fullscreen"), bool):
+                data["settings"]["fullscreen"] = st["fullscreen"]
+            if isinstance(st.get("fs_crisp"), bool):
+                data["settings"]["fs_crisp"] = st["fs_crisp"]
+            if st.get("audio_v") != AUDIO_VERSION:      # eski ses seçimini sıfırla (otomatik + yeniden sihirbaz)
+                data["settings"]["engine"] = "auto"
+                data["settings"]["sound_ok"] = False
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    for o in DEFAULT_OWNED:
+        if o not in data["owned"]:
+            data["owned"].append(o)
+    data["settings"]["audio_v"] = AUDIO_VERSION
+    return data
+
+
+# ================================================================ SES
+RATE = 22050
+
+
+def _synth(f0, f1, dur, vol=0.4, wave_type="square", vib=0.0, vib_hz=0.0, seed=1):
+    rng = random.Random(seed)
+    n = max(1, int(RATE * dur))
+    out = []
+    phase = 0.0
+    for i in range(n):
+        t = i / n
+        f = f0 + (f1 - f0) * t
+        if vib:
+            f *= 1 + vib * math.sin(2 * math.pi * vib_hz * i / RATE)
+        phase = (phase + f / RATE) % 1.0
+        if wave_type == "square":
+            s = 1.0 if phase < 0.5 else -1.0
+        elif wave_type == "pulse":
+            s = 1.0 if phase < 0.25 else -1.0
+        elif wave_type == "tri":
+            s = 4 * abs(phase - 0.5) - 1
+        elif wave_type == "saw":
+            s = 2 * phase - 1
+        elif wave_type == "noise":
+            s = rng.uniform(-1, 1)
+        else:
+            s = math.sin(2 * math.pi * phase)
+        env = min(1.0, i / (RATE * 0.004)) * (1 - t) ** 0.8
+        out.append(s * vol * env)
+    return out
+
+
+def _mix(*tracks):
+    n = max(len(t) for t in tracks)
+    out = [0.0] * n
+    for t in tracks:
+        for i, v in enumerate(t):
+            out[i] += v
+    return out
+
+
+def V(f0, f1, dur, vol=0.4, wave_type="square", vib=0.0, vib_hz=0.0):
+    """Tek ses 'sesi': (başlangıç Hz, bitiş Hz, süre sn, ses, dalga, titreşim, titreşim Hz)."""
+    return (f0, f1, dur, vol, wave_type, vib, vib_hz)
+
+
+def SIL(dur):
+    return V(100, 100, dur, 0.0)
+
+
+# ad: ([parça, ...], öncelik). Her parça aynı anda çalan "seslerin" listesidir.
+# Windows'ta aynı anda tek ses çalabildiği için öncelik, önemli bir sesin
+# küçük sesler tarafından kesilmesini engeller.
+SOUND_DEFS = {
+    "jump":          ([[V(260, 640, 0.17, 0.33)]], 0),
+    "double_jump":   ([[V(420, 980, 0.15, 0.3, "tri", 0.05, 30)]], 0),
+    "coin":          ([[V(988, 988, 0.06, 0.3)], [V(1319, 1319, 0.22, 0.3)]], 1),
+    "xp":            ([[V(1047, 1047, 0.07, 0.3, "tri")], [V(1319, 1319, 0.07, 0.3, "tri")],
+                       [V(1568, 1568, 0.07, 0.3, "tri")], [V(2093, 2093, 0.26, 0.3, "sine")]], 1),
+    "bump":          ([[V(160, 70, 0.09, 0.5)]], 1),
+    "brick":         ([[V(210, 60, 0.09, 0.4), V(0, 0, 0.09, 0.25, "noise")]], 1),
+    "checkpoint":    ([[V(784, 784, 0.08, 0.3, "tri")], [V(1175, 1175, 0.2, 0.3, "tri")]], 1),
+    # her canavar türü için ayrı sesler
+    "stomp_walker":  ([[V(520, 100, 0.15, 0.45)]], 2),
+    "stomp_hopper":  ([[V(180, 720, 0.10, 0.45, "sine")],
+                       [V(720, 160, 0.20, 0.45, "sine", 0.08, 18)]], 2),
+    "stomp_flyer":   ([[V(1600, 260, 0.24, 0.32, "tri", 0.12, 45)]], 2),
+    "stomp_penguin": ([[V(900, 1300, 0.05, 0.35, "pulse")], [V(1300, 300, 0.16, 0.35, "pulse")]], 2),
+    "stomp_bomb":    ([[V(1500, 1500, 0.05, 0.3), V(1800, 1800, 0.05, 0.2)],
+                       [V(300, 120, 0.18, 0.4, "saw")]], 2),
+    "penguin_dash":  ([[V(0, 0, 0.14, 0.22, "noise")]], 1),
+    "plant_chomp":   ([[V(220, 90, 0.07, 0.45, "saw")], [SIL(0.04)],
+                       [V(220, 90, 0.07, 0.45, "saw")]], 2),
+    "ghost_boo":     ([[V(380, 250, 0.42, 0.3, "sine", 0.15, 6)]], 1),
+    "lava_pop":      ([[V(150, 520, 0.09, 0.4, "sine"), V(0, 0, 0.09, 0.2, "noise")]], 1),
+    "bomb_fuse":     ([[V(2200, 2200, 0.03, 0.25)], [SIL(0.05)], [V(2200, 2200, 0.03, 0.25)],
+                       [SIL(0.05)], [V(2400, 2400, 0.03, 0.25)]], 1),
+    "bomb_boom":     ([[V(120, 30, 0.5, 0.6, "saw"), V(0, 0, 0.5, 0.5, "noise")]], 3),
+    "die_spiky":     ([[V(1100, 1100, 0.12, 0.25), V(1650, 1650, 0.12, 0.2)],
+                       [V(500, 70, 0.35, 0.4, "saw")]], 3),
+    "die_plant":     ([[V(260, 100, 0.08, 0.5, "saw")], [SIL(0.03)],
+                       [V(260, 100, 0.08, 0.5, "saw")], [V(330, 60, 0.3, 0.4, "tri")]], 3),
+    "die_ghost":     ([[V(700, 200, 0.5, 0.35, "sine", 0.2, 8)]], 3),
+    "die_lava":      ([[V(0, 0, 0.12, 0.4, "noise")], [V(900, 100, 0.4, 0.35, "saw")]], 3),
+    "die":           ([[V(659, 659, 0.11, 0.35, "tri")], [V(523, 523, 0.11, 0.35, "tri")],
+                       [V(392, 392, 0.11, 0.35, "tri")], [V(330, 196, 0.35, 0.35, "tri")]], 3),
+    "over":          ([[V(392, 392, 0.18, 0.3)], [V(330, 330, 0.18, 0.3)],
+                       [V(262, 262, 0.18, 0.3)], [V(196, 120, 0.5, 0.3)]], 3),
+    "win":           ([[V(523, 523, 0.1, 0.3)], [V(659, 659, 0.1, 0.3)], [V(784, 784, 0.1, 0.3)],
+                       [V(1047, 1047, 0.12, 0.3)],
+                       [V(784, 784, 0.4, 0.25), V(1047, 1047, 0.4, 0.25)]], 3),
+    "test_tone":     ([[V(440, 880, 0.6, 0.5, "sine")], [V(880, 440, 0.6, 0.5, "sine")]], 3),
+    "select":        ([[V(700, 900, 0.05, 0.28)]], 0),
+    "equip":         ([[V(500, 800, 0.08, 0.3, "tri")]], 0),
+    "pause":         ([[V(600, 400, 0.08, 0.28, "tri")]], 0),
+    "buy":           ([[V(1319, 1319, 0.07, 0.3)], [V(1760, 1760, 0.07, 0.3)],
+                       [V(2349, 2349, 0.22, 0.3)]], 1),
+    "error":         ([[V(190, 140, 0.2, 0.4)]], 1),
+    "start":         ([[V(523, 523, 0.07, 0.3, "tri")], [V(659, 659, 0.07, 0.3, "tri")],
+                       [V(784, 784, 0.16, 0.3, "tri")]], 1),
+}
+
+# ölüm sesleri: canavar türü -> ses adı (None = ayrı ölüm sesi çalma)
+DIE_SOUNDS = {"spiky": "die_spiky", "plant": "die_plant", "ghost": "die_ghost",
+              "lavaball": "die_lava", "bomb": None}
+
+
+def build_samples(segments):
+    out = []
+    for seg in segments:
+        tracks = [_synth(*voice) for voice in seg]
+        out += _mix(*tracks) if len(tracks) > 1 else tracks[0]
+    return out
+
+
+def build_tones(segments):
+    """Sadece 'Bip' motoru için: (frekans, ms) listesi. frekans 0 = sessizlik."""
+    tones = []
+    for seg in segments:
+        f0, f1, dur, vol, wt = seg[0][:5]
+        ms = max(20, int(dur * 1000))
+        if vol <= 0:
+            tones.append((0, ms))
+        else:
+            f = 160 if wt == "noise" else int((f0 + f1) / 2)
+            tones.append((max(37, min(32000, f)), ms))
+    return tones
+
+
+def write_wav(path, samples, gain):
+    data = array.array("h", (int(max(-0.98, min(0.98, s * gain)) * 32767) for s in samples))
+    if sys.byteorder == "big":
+        data.byteswap()
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(data.tobytes())
+
+
+def render_sounds(folder, volume=80):
+    """Tüm sesleri WAV olarak yazar. {ad: (yol, süre_sn, öncelik)} döner."""
+    out = {}
+    gain = volume / 100.0 * 2.0
+    for name, (segs, prio) in SOUND_DEFS.items():
+        samples = build_samples(segs)
+        path = os.path.join(folder, name + ".wav")
+        write_wav(path, samples, gain)
+        out[name] = (path, len(samples) / RATE, prio)
+    return out
+
+
+class WAVEFORMATEX(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [("wFormatTag", ctypes.c_ushort), ("nChannels", ctypes.c_ushort),
+                ("nSamplesPerSec", ctypes.c_uint32), ("nAvgBytesPerSec", ctypes.c_uint32),
+                ("nBlockAlign", ctypes.c_ushort), ("wBitsPerSample", ctypes.c_ushort),
+                ("cbSize", ctypes.c_ushort)]
+
+
+class WAVEHDR(ctypes.Structure):
+    _fields_ = [("lpData", ctypes.c_void_p), ("dwBufferLength", ctypes.c_uint32),
+                ("dwBytesRecorded", ctypes.c_uint32), ("dwUser", ctypes.c_size_t),
+                ("dwFlags", ctypes.c_uint32), ("dwLoops", ctypes.c_uint32),
+                ("lpNext", ctypes.c_void_p), ("reserved", ctypes.c_size_t)]
+
+
+WAVE_MAPPER = 0xFFFFFFFF
+WHDR_DONE = 0x1
+
+CMDS = {"afplay": ["afplay"], "paplay": ["paplay"], "pw-play": ["pw-play"],
+        "aplay": ["aplay", "-q"], "play": ["play", "-q"],
+        "ffplay": ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]}
+ENGINE_LABELS = {"auto": "Otomatik", "waveout": "Windows (waveOut, doğrudan)",
+                 "winsound": "Windows (winsound)",
+                 "winsync": "Windows (winsound, ayrı iş parçacığı)",
+                 "mci": "Windows (MCI)", "beep": "Windows (Bip)",
+                 "afplay": "macOS (afplay)", "paplay": "Linux (paplay)",
+                 "pw-play": "Linux (pw-play)", "aplay": "Linux (aplay)",
+                 "play": "SoX (play)", "ffplay": "ffplay"}
+
+
+class Sound:
+    """Sesler kodla üretilir. Birden çok oynatma motoru vardır; biri çalışmazsa
+    Ayarlar'dan değiştirilebilir (Otomatik mod hata olursa kendisi bir sonrakine geçer)."""
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.error = ""
+        self.engines = []
+        self.engine = None
+        self.files = {}
+        self.base = {}
+        self.tones = {}
+        self.folder = ""
+        self.procs = []
+        self.last = {}
+        self.busy_until = 0.0
+        self.busy_prio = -1
+        self.mci_open = False
+        self.beep_q = None
+        self.sync_q = None
+        self.pcm = {}
+        self.wave_active = []
+        self._wv = None
+        self._logged = set()
+        try:
+            self._init()
+        except Exception as ex:                    # ses asla oyunu çökertmesin
+            self._fail(f"başlatma: {type(ex).__name__}: {ex}")
+
+    # ---- yardımcılar
+    @property
+    def enabled(self):
+        return bool(self.settings["sound"])
+
+    def _fail(self, text):
+        self.error = text
+        if text not in self._logged:
+            self._logged.add(text)
+            print("[SES] HATA:", text, file=sys.stderr)
+
+    def _detect(self):
+        out = []
+        if winsound is not None:
+            # MCI uygulamanın kendi ses kanalından çalar; winsound ise Windows'un
+            # "Sistem sesleri" kanalından çalar ve o kanal çoğu bilgisayarda kısık/kapalıdır.
+            try:
+                ctypes.windll.winmm      # noqa: B018  (yalnızca Windows'ta var)
+                out += ["waveout", "mci"]
+            except Exception:
+                pass
+            out += ["winsound", "winsync", "beep"]
+        elif sys.platform == "darwin":
+            if shutil.which("afplay"):
+                out.append("afplay")
+        else:
+            for name in ("paplay", "pw-play", "aplay", "play", "ffplay"):
+                if shutil.which(name):
+                    out.append(name)
+        return out
+
+    def _make_folder(self):
+        for cand in (SOUND_DIR, os.path.join(tempfile.gettempdir(), "mini_mario_sesler")):
+            try:
+                os.makedirs(cand, exist_ok=True)
+                probe = os.path.join(cand, ".yaz")
+                with open(probe, "w") as f:
+                    f.write("1")
+                os.remove(probe)
+                return cand
+            except OSError:
+                continue
+        return tempfile.mkdtemp(prefix="mini_mario_")
+
+    def _init(self):
+        self.engines = self._detect()
+        for name, (segs, prio) in SOUND_DEFS.items():
+            self.base[name] = build_samples(segs)
+            self.tones[name] = build_tones(segs)
+        if not self.engines:
+            self._fail("ses oynatıcı bulunamadı (Linux'ta aplay / paplay kur)")
+            return
+        self.folder = self._make_folder()
+        self._write_files()
+        atexit.register(self._shutdown)
+        self.set_engine(self.settings.get("engine", "auto"))
+        if self.engine == "mci" and not self.mci_open and self.settings.get("engine", "auto") == "auto":
+            alt = [e for e in self.engines if e not in ("mci", "winsync")]
+            if alt:                                   # MCI açılamadıysa otomatik yedeğe geç
+                self.set_engine(alt[0])
+                self.error = ""
+        print(f"[SES] motor={self.engine}  klasör={self.folder}")
+
+    def _write_files(self):
+        """Ses seviyesine göre WAV dosyalarını (yeniden) yazar."""
+        self._mci_close()
+        if winsound is not None:
+            try:
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+        gain = self.settings["volume"] / 100.0 * 2.0
+        self.pcm = {}                                  # waveOut tamponları yeni ses seviyesiyle yeniden kurulur
+        for name, base in self.base.items():
+            path = os.path.join(self.folder, name + ".wav")
+            try:
+                write_wav(path, base, 1.8 if name == "test_tone" else gain)   # test sesi hep yüksek
+            except OSError as ex:
+                self._fail(f"dosya yazılamadı ({name}.wav): {ex}")
+            self.files[name] = (path, len(base) / RATE, SOUND_DEFS[name][1])
+        if self.engine == "mci":
+            self._mci_open_all()
+
+    def apply_volume(self):
+        if self.folder:
+            self._write_files()
+
+    def set_engine(self, choice):
+        if not self.engines:
+            self.engine = None
+            return
+        want = choice if choice in self.engines else self.engines[0]
+        if self.engine == "mci" and want != "mci":
+            self._mci_close()
+        self.engine = want
+        if want == "mci":
+            self._mci_open_all()
+
+    def test_play(self, name):
+        """Sihirbaz için: kısıtlamaları atlayıp seçili motorla çalar. Hata metni döner ('' = hata yok)."""
+        if self.engine is None or name not in self.files:
+            return "motor yok"
+        try:
+            self._play_with(self.engine, name)
+        except Exception as ex:
+            self._fail(f"{self.engine}: {type(ex).__name__}: {ex}")
+            return f"{type(ex).__name__}: {ex}"
+        self.busy_until, self.busy_prio = 0.0, -1
+        return ""
+
+    def report(self, results=None):
+        import platform
+        lines = ["MINI MARIO SES RAPORU",
+                 f"sistem: {platform.platform()}",
+                 f"python: {sys.version.split()[0]}   tk: {getattr(tk, 'TkVersion', '?')}",
+                 f"bulunan motorlar: {self.engines}",
+                 f"secili motor: {self.engine}   (ayar: {self.settings.get('engine')})",
+                 f"ses acik: {self.enabled}   seviye: {self.settings.get('volume')}",
+                 f"klasor: {self.folder}",
+                 f"yazilan dosya sayisi: {len(self.files)}",
+                 f"son hata: {self.error or '-'}",
+                 f"mci acik: {self.mci_open}   waveout acik tampon: {len(self.wave_active)}"]
+        if self.files:
+            p = next(iter(self.files.values()))[0]
+            try:
+                lines.append(f"ornek dosya: {p}  ({os.path.getsize(p)} bayt)")
+            except OSError as ex:
+                lines.append(f"ornek dosya okunamadi: {ex}")
+        for k, v in (results or {}).items():
+            lines.append(f"test [{k}]: {v}")
+        return "\n".join(lines)
+
+    def status(self):
+        if not self.engines:
+            return False, "ses oynatıcı bulunamadı (Linux'ta aplay / paplay kur)"
+        if self.error:
+            return False, self.error
+        return True, f"hazır, motor: {ENGINE_LABELS.get(self.engine, self.engine)}"
+
+    def _shutdown(self):
+        try:
+            self._wave_cleanup(force=True)
+        except Exception:
+            pass
+        try:
+            self._mci_close()
+        except Exception:
+            pass
+
+    # ---- MCI (Windows, ctypes)
+    def _mci(self, cmd):
+        import ctypes
+        buf = ctypes.create_unicode_buffer(256)
+        err = ctypes.windll.winmm.mciSendStringW(cmd, buf, 255, 0)
+        if err:
+            eb = ctypes.create_unicode_buffer(256)
+            ctypes.windll.winmm.mciGetErrorStringW(err, eb, 255)
+            raise RuntimeError(f"MCI {err}: {eb.value}")
+        return buf.value
+
+    def _mci_open_all(self):
+        # "waveaudio" aygıtı bazı Windows kurulumlarında kayıtlı değildir (MCI 263);
+        # o yüzden türü belirtmeden ve başka türlerle de dene.
+        forms = ['open "{p}" type waveaudio alias mm_{n}', 'open "{p}" alias mm_{n}',
+                 'open "{p}" type mpegvideo alias mm_{n}']
+        try:
+            first_err = None
+            for name, (path, _, _) in self.files.items():
+                done = False
+                for form in list(forms):
+                    try:
+                        self._mci(form.format(p=path, n=name))
+                        forms = [form]                  # çalışan biçimi sonrakilerde kullan
+                        done = True
+                        break
+                    except Exception as ex:
+                        first_err = first_err or ex
+                if not done:
+                    raise first_err
+            self.mci_open = True
+        except Exception as ex:
+            self._fail(f"MCI açılamadı: {ex}")
+
+    def _mci_close(self):
+        if not self.mci_open:
+            return
+        self.mci_open = False
+        try:
+            self._mci("close all")
+        except Exception:
+            pass
+
+    # ---- waveOut (Windows, ctypes): MCI / winsound kayıtları bozuk olsa da çalışır
+    def _wave_setup(self):
+        c = ctypes
+        w = c.windll.winmm
+        w.waveOutOpen.argtypes = [c.POINTER(c.c_void_p), c.c_uint, c.POINTER(WAVEFORMATEX),
+                                  c.c_size_t, c.c_size_t, c.c_uint]
+        for fn in ("waveOutPrepareHeader", "waveOutWrite", "waveOutUnprepareHeader"):
+            getattr(w, fn).argtypes = [c.c_void_p, c.POINTER(WAVEHDR), c.c_uint]
+            getattr(w, fn).restype = c.c_uint
+        w.waveOutOpen.restype = c.c_uint
+        w.waveOutReset.argtypes = [c.c_void_p]
+        w.waveOutReset.restype = c.c_uint
+        w.waveOutClose.argtypes = [c.c_void_p]
+        w.waveOutClose.restype = c.c_uint
+        self._wv = w
+
+    def _wave_err(self, code, what):
+        try:
+            buf = ctypes.create_unicode_buffer(256)
+            self._wv.waveOutGetErrorTextW(code, buf, 255)
+            return f"{what} hata {code}: {buf.value}"
+        except Exception:
+            return f"{what} hata {code}"
+
+    def _wave_cleanup(self, force=False):
+        if self._wv is None:
+            return
+        w, keep = self._wv, []
+        for handle, hdr, buf in self.wave_active:
+            if force or (hdr.dwFlags & WHDR_DONE):
+                if force:
+                    w.waveOutReset(handle)
+                w.waveOutUnprepareHeader(handle, ctypes.byref(hdr), ctypes.sizeof(hdr))
+                w.waveOutClose(handle)
+            else:
+                keep.append((handle, hdr, buf))
+        self.wave_active = keep
+
+    def _wave_play(self, name):
+        if self._wv is None:
+            self._wave_setup()
+        w = self._wv
+        self._wave_cleanup()
+        if len(self.wave_active) >= 24:
+            return
+        pcm = self.pcm.get(name)
+        if pcm is None:
+            gain = 1.8 if name == "test_tone" else self.settings["volume"] / 100.0 * 2.0
+            data = array.array("h", (int(max(-0.98, min(0.98, v * gain)) * 32767)
+                                     for v in self.base[name]))
+            if sys.byteorder == "big":
+                data.byteswap()
+            pcm = self.pcm[name] = data.tobytes()
+        buf = ctypes.create_string_buffer(pcm, len(pcm))
+        fmt = WAVEFORMATEX(1, 1, RATE, RATE * 2, 2, 16, 0)       # PCM, mono, 16 bit
+        handle = ctypes.c_void_p()
+        r = w.waveOutOpen(ctypes.byref(handle), WAVE_MAPPER, ctypes.byref(fmt), 0, 0, 0)
+        if r:
+            raise RuntimeError(self._wave_err(r, "waveOutOpen"))
+        hdr = WAVEHDR()
+        hdr.lpData = ctypes.addressof(buf)
+        hdr.dwBufferLength = len(pcm)
+        size = ctypes.sizeof(hdr)
+        r = w.waveOutPrepareHeader(handle, ctypes.byref(hdr), size)
+        if r:
+            w.waveOutClose(handle)
+            raise RuntimeError(self._wave_err(r, "waveOutPrepareHeader"))
+        r = w.waveOutWrite(handle, ctypes.byref(hdr), size)
+        if r:
+            w.waveOutUnprepareHeader(handle, ctypes.byref(hdr), size)
+            w.waveOutClose(handle)
+            raise RuntimeError(self._wave_err(r, "waveOutWrite"))
+        self.wave_active.append((handle, hdr, buf))
+
+    # ---- winsound, ayrı iş parçacığında (eşzamanlı çalma)
+    def _sync_worker(self):
+        while True:
+            path = self.sync_q.get()
+            try:
+                winsound.PlaySound(path, winsound.SND_FILENAME)
+            except Exception as ex:
+                self._fail(f"winsync hatası: {ex}")
+
+    # ---- Bip (Windows, son çare)
+    def _beep_worker(self):
+        while True:
+            tones = self.beep_q.get()
+            for f, ms in tones:
+                try:
+                    if f:
+                        winsound.Beep(int(f), int(ms))
+                    else:
+                        time.sleep(ms / 1000.0)
+                except Exception as ex:
+                    self._fail(f"Bip hatası: {ex}")
+                    break
+
+    # ---- çalma
+    def play(self, name):
+        if not self.enabled or self.engine is None or name not in self.files:
+            return
+        now = time.monotonic()
+        if now - self.last.get(name, 0.0) < 0.04:
+            return
+        prio = self.files[name][2]
+        if self.engine in ("winsound", "beep") and now < self.busy_until and prio < self.busy_prio:
+            return
+        try:
+            self._play_with(self.engine, name)
+        except Exception as ex:
+            self._fail(f"{self.engine}: {type(ex).__name__}: {ex}")
+            if self.settings.get("engine", "auto") == "auto":
+                i = self.engines.index(self.engine) if self.engine in self.engines else -1
+                for cand in [e for e in self.engines[i + 1:] if e != "winsync"]:   # winsync aynı çağrıyı kullanır
+                    self.set_engine(cand)                 # otomatik: çalışan bir motor bulana kadar sırayla dene
+                    if cand == "mci" and not self.mci_open:
+                        continue
+                    self.error = ""
+                    try:
+                        self._play_with(cand, name)
+                        break
+                    except Exception as ex2:
+                        self._fail(f"{cand}: {type(ex2).__name__}: {ex2}")
+            return
+        self.last[name] = now
+
+    def _play_with(self, engine, name):
+        path, dur, prio = self.files[name]
+        now = time.monotonic()
+        if engine == "winsound":
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            self.busy_until, self.busy_prio = now + dur, prio
+        elif engine == "waveout":
+            self._wave_play(name)
+        elif engine == "winsync":
+            if self.sync_q is None:
+                self.sync_q = queue.Queue()
+                threading.Thread(target=self._sync_worker, daemon=True).start()
+            if self.sync_q.qsize() < 3:
+                self.sync_q.put(path)
+        elif engine == "mci":
+            self._mci(f"play mm_{name} from 0")
+        elif engine == "beep":
+            if self.beep_q is None:
+                self.beep_q = queue.Queue()
+                threading.Thread(target=self._beep_worker, daemon=True).start()
+            if self.beep_q.qsize() < 3:
+                self.beep_q.put(self.tones[name])
+                self.busy_until = now + sum(ms for _, ms in self.tones[name]) / 1000.0
+                self.busy_prio = prio
+        else:
+            self.procs = [p for p in self.procs if p.poll() is None]
+            if len(self.procs) > 8:
+                return
+            self.procs.append(subprocess.Popen(
+                CMDS[engine] + [path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+
+
+# ================================================================ GRAFİK (piksel dokular)
+def _rgb(c):
+    return int(c[1:3], 16), int(c[3:5], 16), int(c[5:7], 16)
+
+
+def _hex(r, g, b):
+    return "#%02x%02x%02x" % (max(0, min(255, int(r))), max(0, min(255, int(g))),
+                              max(0, min(255, int(b))))
+
+
+def shade(c, f):
+    """f>0: beyaza doğru aç, f<0: siyaha doğru koyulaştır."""
+    r, g, b = _rgb(c)
+    if f >= 0:
+        return _hex(r + (255 - r) * f, g + (255 - g) * f, b + (255 - b) * f)
+    return _hex(r * (1 + f), g * (1 + f), b * (1 + f))
+
+
+def mix(c1, c2, t):
+    a, b = _rgb(c1), _rgb(c2)
+    return _hex(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t)
+
+
+class Pix:
+    """Küçük piksel tuvali. None = saydam."""
+    def __init__(self, w=TILE, h=TILE):
+        self.w, self.h = w, h
+        self.px = [[None] * w for _ in range(h)]
+
+    def set(self, x, y, col):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            self.px[y][x] = col
+
+    def rect(self, x1, y1, x2, y2, col):
+        for y in range(max(0, y1), min(self.h, y2)):
+            row = self.px[y]
+            for x in range(max(0, x1), min(self.w, x2)):
+                row[x] = col
+
+    def to_image(self, fallback):
+        img = tk.PhotoImage(width=self.w, height=self.h)
+        holes = []
+        rows = []
+        for y in range(self.h):
+            cells = []
+            for x in range(self.w):
+                v = self.px[y][x]
+                if v is None:
+                    holes.append((x, y))
+                    v = fallback
+                cells.append(v)
+            rows.append("{" + " ".join(cells) + "}")
+        img.put(" ".join(rows))
+        for x, y in holes:
+            try:
+                img.transparency_set(x, y, True)
+            except (AttributeError, tk.TclError):
+                break
+        return img
+
+
+def make_ground_tile(th, seed, grass, lo, ro):
+    pad = GRASS_PAD if grass else 0
+    p = Pix(TILE, TILE + pad)
+    rng = random.Random(seed * 7919 + (13 if grass else 0))
+    base = th["ground"]
+    for y in range(TILE):                                   # toprak (hafif degrade)
+        col = shade(base, -0.14 * y / TILE)
+        for x in range(TILE):
+            p.px[y + pad][x] = col
+    for _ in range(70):                                     # benekler
+        x, y = rng.randrange(TILE), rng.randrange(TILE)
+        f = rng.choice((-0.2, -0.12, 0.12, 0.2))
+        p.set(x, y + pad, shade(base, f))
+        if rng.random() < 0.4:
+            p.set(x + 1, y + pad, shade(base, f))
+    for _ in range(3):                                      # çakıl taşları
+        x = rng.randrange(3, TILE - 8)
+        y = rng.randrange(16 if grass else 6, TILE - 6) + pad
+        p.rect(x, y, x + 5, y + 3, shade(base, 0.22))
+        p.rect(x, y + 3, x + 5, y + 4, shade(base, -0.38))
+        p.rect(x + 1, y, x + 3, y + 1, shade(base, 0.4))
+    if lo:                                                  # uçurum kenarı gölgesi
+        p.rect(0, pad, 3, TILE + pad, shade(base, -0.42))
+        p.rect(3, pad, 4, TILE + pad, shade(base, -0.22))
+    if ro:
+        p.rect(TILE - 3, pad, TILE, TILE + pad, shade(base, -0.42))
+        p.rect(TILE - 4, pad, TILE - 3, TILE + pad, shade(base, -0.22))
+    if grass:
+        green, edge = th["top"], th["top_edge"]
+        for x in range(TILE):                               # çim şapkası
+            depth = 10 + int(3 * (1 + math.sin(x * 0.55 + seed * 2.1))) + rng.randrange(2)
+            for y in range(depth):
+                p.px[pad + y][x] = shade(green, 0.22 - 0.5 * y / depth)
+            p.set(x, pad + depth, edge)
+        x = 3 if lo else 1                                  # çim telleri
+        x_end = TILE - 4 if ro else TILE - 2
+        while x < x_end:
+            h = rng.randrange(3, 7)
+            for k in range(h):
+                tone = 0.32 - 0.03 * k if (x // 3) % 2 else 0.16 - 0.03 * k
+                p.set(x, pad - 1 - k, shade(green, tone))
+                if k < h - 1:
+                    p.set(x + 1, pad - 1 - k, shade(green, tone - 0.18))
+            x += rng.randrange(3, 6)
+        if lo:                                              # yuvarlak köşeler
+            for yy in range(3):
+                for xx in range(3 - yy):
+                    p.px[pad + yy][xx] = None
+        if ro:
+            for yy in range(3):
+                for xx in range(3 - yy):
+                    p.px[pad + yy][TILE - 1 - xx] = None
+    return p
+
+
+def make_brick_tile(th, seed=1):
+    p = Pix()
+    rng = random.Random(seed)
+    base = th["brick"]
+    mortar = shade(base, -0.55)
+    p.rect(0, 0, TILE, TILE, mortar)
+    for course in range(4):
+        y0 = course * 10
+        start = -10 if course % 2 else 0
+        for bx in range(start, TILE, 20):
+            col = shade(base, rng.uniform(-0.07, 0.07))
+            x1, x2 = max(bx + 1, 0), min(bx + 20, TILE)
+            p.rect(x1, y0 + 1, x2, y0 + 10, col)
+            p.rect(x1, y0 + 1, x2, y0 + 2, shade(col, 0.28))          # üst parlama
+            if bx + 1 >= 0:
+                p.rect(bx + 1, y0 + 1, bx + 2, y0 + 10, shade(col, 0.16))   # sol
+            p.rect(x1, y0 + 9, x2, y0 + 10, shade(col, -0.25))        # alt gölge
+            if bx + 19 < TILE:
+                p.rect(bx + 19, y0 + 1, bx + 20, y0 + 10, shade(col, -0.16))  # sağ
+            for _ in range(5):                                        # doku
+                p.set(rng.randrange(x1, max(x1 + 1, x2)), y0 + rng.randrange(2, 9),
+                      shade(col, rng.choice((-0.12, 0.12))))
+    return p
+
+
+def make_stone_tile(th):
+    p = Pix()
+    rng = random.Random(5)
+    base = th["stone"]
+    p.rect(0, 0, TILE, TILE, shade(base, -0.55))
+    p.rect(1, 1, TILE - 1, TILE - 1, base)
+    for i in range(1, 5):
+        p.rect(i, i, TILE - i, i + 1, shade(base, 0.45 - 0.05 * i))
+        p.rect(i, i, i + 1, TILE - i, shade(base, 0.30 - 0.04 * i))
+        p.rect(i, TILE - i - 1, TILE - i, TILE - i, shade(base, -0.25 - 0.05 * i))
+        p.rect(TILE - i - 1, i, TILE - i, TILE - i, shade(base, -0.2 - 0.04 * i))
+    p.rect(5, 5, TILE - 5, TILE - 5, base)
+    for _ in range(24):
+        p.set(rng.randrange(6, TILE - 6), rng.randrange(6, TILE - 6),
+              shade(base, rng.choice((-0.1, 0.1))))
+    return p
+
+
+_QMARK = ["01110", "10001", "00001", "00010", "00100", "00000", "00100"]
+
+
+def make_q_tile(pulse, used):
+    p = Pix()
+    if used:
+        base, hi, lo, ol = "#8f7a5c", "#b49c78", "#5e4c34", "#33281a"
+    else:
+        base, hi, lo, ol = ("#ffc73a", "#fff0a0", "#c27a00", "#5e3300") if pulse \
+            else ("#f6b21a", "#ffe27a", "#c27a00", "#5e3300")
+    p.rect(0, 0, TILE, TILE, ol)
+    for y in range(2, TILE - 2):
+        col = mix(shade(base, 0.12), shade(base, -0.12), (y - 2) / (TILE - 4))
+        for x in range(2, TILE - 2):
+            p.px[y][x] = col
+    p.rect(2, 2, TILE - 2, 4, hi)
+    p.rect(2, 2, 4, TILE - 2, hi)
+    p.rect(2, TILE - 4, TILE - 2, TILE - 2, lo)
+    p.rect(TILE - 4, 2, TILE - 2, TILE - 2, lo)
+    for x, y in ((6, 6), (TILE - 9, 6), (6, TILE - 9), (TILE - 9, TILE - 9)):   # perçinler
+        p.rect(x, y, x + 3, y + 3, lo)
+        p.set(x, y, hi)
+    if not used:
+        x0, y0 = 12, 9
+        for gy, row in enumerate(_QMARK):                    # "?" işareti
+            for gx, ch in enumerate(row):
+                if ch == "1":
+                    p.rect(x0 + gx * 3 + 1, y0 + gy * 3 + 1, x0 + gx * 3 + 4, y0 + gy * 3 + 4,
+                           shade(lo, -0.4))
+        for gy, row in enumerate(_QMARK):
+            for gx, ch in enumerate(row):
+                if ch == "1":
+                    p.rect(x0 + gx * 3, y0 + gy * 3, x0 + gx * 3 + 3, y0 + gy * 3 + 3, "#fffbe0")
+    return p
+
+
+def make_pipe_tile(top, left, base="#2cb52c"):
+    p = Pix()
+    outline = "#093a09"
+
+    def col_at(x):
+        t = (x + (0 if left else TILE)) / (2 * TILE - 1)
+        if 0.10 <= t < 0.17:
+            return "#a6f7a6"
+        if 0.17 <= t < 0.22:
+            return "#6ee06e"
+        return mix(shade(base, 0.12), shade(base, -0.38), t)
+
+    bx1, bx2 = (3, TILE) if left else (0, TILE - 3)          # gövde, dış kenarlardan içeride
+    for y in range(TILE):
+        for x in range(TILE):
+            in_rim = top and y < 18
+            in_body = bx1 <= x < bx2 and (not top or y >= 18)
+            if in_rim:
+                col = col_at(x)
+                if y in (1, 2):
+                    col = shade(col, 0.28)
+                elif y in (14, 15, 16):
+                    col = shade(col, -0.22)
+                if y in (0, 17) or (left and x == 0) or (not left and x == TILE - 1):
+                    col = outline
+                p.px[y][x] = col
+            elif in_body:
+                col = col_at(x)
+                if top and y < 21:
+                    col = shade(col, -0.3)                    # başlığın gölgesi
+                if (left and x == bx1) or (not left and x == bx2 - 1):
+                    col = outline
+                p.px[y][x] = col
+    return p
+
+
+# ---------------------------------------------------------------- Seviye kurulumu
+def build_level(spec):
+    """Karakterler: # zemin, S taş blok (merdiven), B tuğla, ? gizemli blok,
+    U kullanılmış blok, T boru, o altın, F bayrak, . boşluk"""
+    cols = spec["cols"]
+    g = [["."] * cols for _ in range(ROWS)]
+    for c in range(cols):
+        if not any(a <= c <= b for a, b in spec["gaps"]):
+            g[10][c] = g[11][c] = "#"
+    for row, a, b in spec["bricks"]:
+        for c in range(a, b + 1):
+            g[row][c] = "B"
+    for row, c in spec["qs"]:
+        g[row][c] = "?"
+    for col, h in spec["pipes"]:
+        for hh in range(h):
+            for dc in (0, 1):
+                g[9 - hh][col + dc] = "T"
+    for i in range(5):
+        for hh in range(i + 1):
+            g[9 - hh][spec["stairs"] + i] = "S"
+
+    def put_coin(r, c):
+        if 0 <= r < ROWS and 0 <= c < cols and g[r][c] == ".":
+            g[r][c] = "o"
+
+    for row, a, b in spec["bricks"]:            # platformların üstüne
+        for c in range(a, b + 1):
+            put_coin(row - 1, c)
+    for a, b in spec["gaps"]:                   # uçurumların üstüne
+        for c in range(a, b + 1):
+            put_coin(8, c)
+    for row, a, b in spec.get("extra_coins", []):
+        for c in range(a, b + 1):
+            put_coin(row, c)
+
+    flag = cols - 4
+    for r in range(0, 10):                      # direk tavana kadar (üstünden atlanamaz)
+        g[r][flag] = "F"
+    return g
+
+
+# ---------------------------------------------------------------- Varlıklar
+class Entity:
+    def __init__(self, x, y, w, h):
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self.vx = 0.0
+        self.vy = 0.0
+        self.on_ground = False
+        self.kind = "walker"
+        self.alive = True
+        self.squash = 0
+
+
+class Player(Entity):
+    def __init__(self, idx, lives):
+        super().__init__(0, 0, 28, 36)
+        self.idx = idx
+        self.lives = lives
+        self.score = 0
+        self.coins = 0
+        self.face = 1
+        self.invuln = 0
+        self.coyote = 0
+        self.jump_buf = 0
+        self.air_jumps = MAX_AIR_JUMPS
+        self.jump_held = False
+        self.dead_t = 0          # >0: yeniden doğmayı bekliyor
+        self.out = False         # canı bitti
+        self.safe_x = None       # son güvenli zemin konumu
+        self.safe_y = None
+        self.keymap = KEYS_SOLO
+
+
+def hit_rect(pl, r):
+    x, y, w, h = r
+    return pl.x < x + w and pl.x + pl.w > x and pl.y < y + h and pl.y + pl.h > y
+
+
+# canavar türü -> temel hız (zorluk çarpanı ile çarpılır)
+BASE_SPEED = {"walker": 1.2, "spiky": 1.6, "hopper": 1.0, "penguin": 1.0, "bomb": 0.9,
+              "flyer": 1.4, "ghost": 1.05}
+
+
+def make_enemy(kind, col, row=None, spec=None, mult=1.0):
+    if kind == "flyer":
+        e = Entity(col * TILE + 4, (row or 6) * TILE, 32, 28)
+        e.base_y, e.start_x = e.y, e.x
+        e.phase = random.random() * 6
+        e.dir = -1
+    elif kind == "ghost":
+        e = Entity(col * TILE + 4, (row or 5) * TILE, 30, 30)
+        e.chasing = False
+        e.boo_cd = 0
+    elif kind == "lavaball":
+        e = Entity(col * TILE + 7, H + 10, 26, 26)
+        e.state = "wait"
+        e.t = random.randint(20, 120)
+    elif kind == "plant":
+        h = dict(spec["pipes"])[col]
+        e = Entity(col * TILE + 24, (10 - h) * TILE - 52, 32, 52)
+        e.cx = col * TILE + TILE
+        e.top = (10 - h) * TILE
+        e.ext = 0
+        e.t = random.randint(0, 99)
+    else:                                   # yürüyenler: walker, spiky, hopper, penguin, bomb
+        e = Entity(col * TILE + 4, 10 * TILE - 32, 32, 32)
+        e.dir = -1
+        if kind == "hopper":
+            e.timer = random.randint(20, 70)
+        elif kind == "penguin":
+            e.dash = 0
+            e.cool = random.randint(30, 100)
+        elif kind == "bomb":
+            e.state = "walk"
+            e.fuse = 0
+    e.kind = kind
+    e.speed = BASE_SPEED.get(kind, 1.0) * mult
+    e.exploded = False
+    return e
+
+
+# ---------------------------------------------------------------- Mario çizimi
+def draw_mario(c, x, y, face, look, scale=1.0, step=0):
+    """Mario'yu (x, y) sol-üst köşesine çizer. 28x36 piksel * scale."""
+    s = scale
+
+    def R(x1, y1, x2, y2, col, mirror=False):
+        if mirror and face < 0:
+            x1, x2 = 28 - x1, 28 - x2
+        c.create_rectangle(x + x1 * s, y + y1 * s, x + x2 * s, y + y2 * s,
+                           fill=col, outline="")
+
+    def P(pts, col, mirror=False):
+        flat = []
+        for px, py in pts:
+            if mirror and face < 0:
+                px = 28 - px
+            flat += [x + px * s, y + py * s]
+        c.create_polygon(*flat, fill=col, outline="")
+
+    hat, overall, boots, acc = look["hat"], look["overall"], look["boots"], look["acc"]
+    if "cape" in acc:
+        P([(5, 18), (-8, 28), (-10, 42), (8, 34)], "#d01040", True)
+    R(2 + step, 30, 12 + step, 36, boots)              # botlar
+    R(16 - step, 30, 26 - step, 36, boots)
+    R(2 + step, 30, 12 + step, 32, shade(boots, 0.25))  # bot parlaması
+    R(16 - step, 30, 26 - step, 32, shade(boots, 0.25))
+    R(2, 18, 26, 28, hat)                              # gömlek
+    R(5, 22, 23, 32, overall)                          # tulum
+    R(3, 8, 25, 18, "#ffcc99")                         # yüz
+    R(2, 0, 26, 8, hat)                                # şapka
+    R(14, 6, 30, 10, hat, True)                        # siper
+    R(17, 10, 21, 14, "black", True)                   # göz
+    if "mustache" in acc:
+        R(10, 14, 26, 17, "#3a1a05", True)
+    if "shades" in acc:
+        R(5, 9, 25, 14, "#111111")
+        R(8, 10, 11, 12, "#666666")
+        R(17, 10, 20, 12, "#666666")
+    if "bowtie" in acc:
+        P([(14, 19), (7, 16), (7, 23)], "#ff3b6b")
+        P([(14, 19), (21, 16), (21, 23)], "#ff3b6b")
+        R(12, 17, 16, 21, "#c01040")
+    if "crown" in acc:
+        P([(4, 2), (4, -7), (9, -2), (14, -9), (19, -2), (24, -7), (24, 2)], "#ffd700")
+
+
+# ================================================================ OYUN
+CARD_W, CARD_H, CARD_GAP = 180, 84, 12
+
+
+def card_rect(i):
+    x = 22 + (i % 4) * (CARD_W + CARD_GAP)
+    y = 108 + (i // 4) * (CARD_H + CARD_GAP)
+    return x, y, x + CARD_W, y + CARD_H
+
+
+
+SCALES = [(n, 4) for n in range(4, 25)]            # 1.0, 1.25, 1.5 ... 6.0 (blok boyu hep tam piksel)
+SCALES_CRISP = [(n, 4) for n in range(4, 25, 4)]  # sadece tam sayı katları: en keskin görüntü
+
+
+class View:
+    """Çizimi mantıksal 800x480 koordinatlarından gerçek pencereye ölçekler (tam ekran için).
+    Ölçek hep 40 pikselin tam katı bir blok boyu verir (1, 1.25, 1.5 ... 4), ortalanır ve
+    kalan yerler siyah kalır."""
+
+    def __init__(self, cv):
+        self.cv = cv
+        self.p, self.q = 1, 1
+        self.ox = self.oy = 0.0
+        self.win = (W, H)
+        self.imgs = {}
+
+    @property
+    def f(self):
+        return self.p / self.q
+
+    def fit(self, w, h, crisp=False):
+        fit = min(w / W, h / H)
+        best = (4, 4)
+        for p, q in (SCALES_CRISP if crisp else SCALES):
+            if p / q <= fit + 1e-9:
+                best = (p, q)
+        g = math.gcd(best[0], best[1])
+        best = (best[0] // g, best[1] // g)
+        if best != (self.p, self.q):
+            self.imgs = {}
+        self.p, self.q = best
+        self.win = (w, h)
+        self.ox, self.oy = (w - W * self.f) / 2, (h - H * self.f) / 2
+
+    def letterbox(self):
+        """Oyun alanının dışına taşan her şeyi siyah bantlarla örter (tam ekranda bozulmayı önler)."""
+        w, h = self.win
+        x1, y1 = round(self.ox), round(self.oy)
+        x2, y2 = round(self.ox + W * self.f), round(self.oy + H * self.f)
+        cv = self.cv
+        if x1 > 0:
+            cv.create_rectangle(0, 0, x1, h, fill="black", outline="")
+        if x2 < w:
+            cv.create_rectangle(x2, 0, w, h, fill="black", outline="")
+        if y1 > 0:
+            cv.create_rectangle(x1, 0, x2, y1, fill="black", outline="")
+        if y2 < h:
+            cv.create_rectangle(x1, y2, x2, h, fill="black", outline="")
+
+    def _x(self, x):
+        return self.ox + x * self.f
+
+    def _y(self, y):
+        return self.oy + y * self.f
+
+    def _pts(self, pts):
+        return [self._x(v) if i % 2 == 0 else self._y(v) for i, v in enumerate(pts)]
+
+    def _kw(self, kw):
+        if self.f != 1:
+            if "width" in kw:
+                kw["width"] = max(1, round(kw["width"] * self.f))
+            if "font" in kw:
+                fam, size, *rest = kw["font"]
+                kw["font"] = (fam, max(6, round(size * self.f)), *rest)
+        return kw
+
+    def _scaled(self, img):
+        if self.f == 1:
+            return img
+        key = (id(img), self.p, self.q)
+        hit = self.imgs.get(key)
+        if hit is None:
+            big = img.zoom(self.p)
+            hit = (big.subsample(self.q) if self.q > 1 else big, img)
+            self.imgs[key] = hit
+        return hit[0]
+
+    def delete(self, *a):
+        return self.cv.delete(*a)
+
+    def create_rectangle(self, x1, y1, x2, y2, **kw):
+        return self.cv.create_rectangle(self._x(x1), self._y(y1), self._x(x2), self._y(y2), **self._kw(kw))
+
+    def create_oval(self, x1, y1, x2, y2, **kw):
+        return self.cv.create_oval(self._x(x1), self._y(y1), self._x(x2), self._y(y2), **self._kw(kw))
+
+    def create_arc(self, x1, y1, x2, y2, **kw):
+        return self.cv.create_arc(self._x(x1), self._y(y1), self._x(x2), self._y(y2), **self._kw(kw))
+
+    def create_polygon(self, *pts, **kw):
+        return self.cv.create_polygon(*self._pts(pts), **self._kw(kw))
+
+    def create_line(self, *pts, **kw):
+        return self.cv.create_line(*self._pts(pts), **self._kw(kw))
+
+    def create_text(self, x, y, **kw):
+        return self.cv.create_text(self._x(x), self._y(y), **self._kw(kw))
+
+    def create_image(self, x, y, image=None, anchor="nw", **kw):
+        return self.cv.create_image(self._x(x), self._y(y), image=self._scaled(image), anchor=anchor)
+
+
+SETTINGS_ROWS = ["sound", "volume", "engine", "test", "wizard", "difficulty", "players",
+                 "fullscreen", "fsmode", "controls", "back"]
+
+# menü düğmeleri: (ad, yazı, tuş, renk)
+MENU_BUTTONS = [("start", "BAŞLA", "ENTER", "#2e9d2e"), ("shop", "ÖZELLEŞTİR", "K", "#2a50e0"),
+                ("settings", "AYARLAR", "S", "#d9822b")]
+
+
+def button_rect(i):
+    bw, gap = 190, 20
+    x = (W - (3 * bw + 2 * gap)) / 2 + i * (bw + gap)
+    return x, 422, x + bw, 464
+
+
+class Game:
+    def __init__(self, root):
+        self.root = root
+        self.cv = tk.Canvas(root, width=W, height=H, highlightthickness=0, bg="black")
+        self.cv.pack(fill="both", expand=True)
+        self.canvas = View(self.cv)
+        self.fullscreen = False
+        self.keys = set()
+        self.pending_release = set()
+        self.frame = 0
+        self.save = load_save()
+        self.settings = self.save["settings"]
+        self.snd = Sound(self.settings)
+        self.tiles = {}
+        self.sel_level = 0
+        self.shop_row = 0
+        self.shop_col = [0, 0, 0, 0]
+        self.shop_player = 0
+        self.shop_msg = ""
+        self.shop_msg_t = 0
+        self.shop_from = "menu"
+        self.set_row = 0
+        self.settings_from = "menu"
+        self.vol_job = None
+        self.toast = ""
+        self.toast_t = 0
+        self.popups = []
+        self.particles = []
+        self.bumped = {}
+        self.players = []
+        self.base_scores = [0]
+        self.look = 0.0
+        self.cam = 0.0
+        self.start_level(0)
+        self.state = "menu"
+        root.bind("<KeyPress>", self.on_down)
+        root.bind("<KeyRelease>", self.on_up)
+        root.bind("<FocusOut>", self.on_focus_out)
+        self.cv.bind("<Button-1>", self.on_click)
+        self.cv.bind("<Configure>", self.on_resize)
+        if self.settings["fullscreen"]:
+            root.after(250, lambda: self.set_fullscreen(True))
+        self.acc = STEP
+        self.last_t = time.perf_counter()
+        self.tick()
+
+    # ---- kayıt
+    def write_save(self):
+        try:
+            with open(SAVE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.save, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    # ---- bölüm yönetimi
+    def start_level(self, idx, scores=None):
+        self.level_idx = idx
+        self.spec = LEVELS[idx]
+        self.theme = THEMES[self.spec["theme"]]
+        self.cols = self.spec["cols"]
+        self.grid = build_level(self.spec)
+        self.pipe_left = {col for col, _ in self.spec["pipes"]}
+        self.diff = DIFFICULTIES[self.settings["difficulty"]]
+        self.enemies = [make_enemy(t[0], t[1], t[2] if len(t) > 2 else None,
+                                   self.spec, self.diff["speed"])
+                        for t in self.spec["enemies"]]
+        n = self.settings["players"]
+        scores = list(scores) if scores else []
+        scores = (scores + [0] * n)[:n]
+        self.players = [Player(i, self.diff["lives"]) for i in range(n)]
+        for pl, sc in zip(self.players, scores):
+            pl.score = sc
+        self.base_scores = list(scores)
+        self.assign_keys()
+        self.checks = [self.snap_check(c) for c in self.spec["checks"]]
+        self.checkpoint = None
+        self.popups = []
+        self.particles = []
+        self.bumped = {}
+        self.state = "play"
+        self.prewarm()
+        for pl in self.players:
+            self.spawn(pl, start=True)
+        self.look = 0.0
+        self.snap_camera()
+
+    def begin_run(self, idx):
+        self.start_level(idx, [0, 0])
+
+    def restart_level(self):
+        self.start_level(self.level_idx, self.base_scores)
+
+    def assign_keys(self):
+        if len(self.players) == 1:
+            self.players[0].keymap = KEYS_SOLO
+        else:
+            self.players[0].keymap = KEYS_P1
+            self.players[1].keymap = KEYS_P2
+
+    def snap_check(self, col):
+        """Kontrol noktasını en yakın güvenli zemine kaydır."""
+        def ok(c):
+            if not (2 <= c < self.cols - 6):
+                return False
+            for cc in (c - 1, c, c + 1):
+                if self.grid[10][cc] != "#":
+                    return False
+                if self.grid[9][cc] not in ".o" or self.grid[8][cc] not in ".o":
+                    return False
+            for e in self.enemies:
+                if e.kind == "lavaball":
+                    continue
+                ex = e.cx if e.kind == "plant" else e.x
+                if abs(ex - c * TILE) < 130:
+                    return False
+            return True
+        for d in range(0, 16):
+            for c in (col - d, col + d):
+                if ok(c):
+                    return c
+        return col
+
+    def spawn_point(self, pl, start):
+        base = (self.checkpoint if self.checkpoint is not None else 2 * TILE + 6)
+        x, y = base + (pl.idx * 36 if start else 0), 10 * TILE - 36
+        if not start:
+            other = next((q for q in self.players if q is not pl and not q.out
+                          and q.dead_t == 0 and q.safe_x is not None), None)
+            if other is not None:
+                x, y = other.safe_x, other.safe_y
+        return x, y
+
+    def spawn(self, pl, start=False):
+        pl.x, pl.y = self.spawn_point(pl, start)
+        pl.vx = pl.vy = 0.0
+        pl.on_ground = False
+        pl.dead_t = 0
+        pl.invuln = 90 if start else self.diff["invuln"]
+        pl.coyote = pl.jump_buf = 0
+        pl.air_jumps = MAX_AIR_JUMPS
+        pl.safe_x, pl.safe_y = pl.x, pl.y
+
+    def snap_camera(self):
+        al = [p for p in self.players if not p.out]
+        if not al:
+            return
+        mid = sum(p.x for p in al) / len(al) + 14
+        frac = 0.4 if len(self.players) == 1 else 0.5
+        self.cam = max(0, min(self.cols * TILE - W, mid - W * frac))
+
+    def alive_players(self):
+        return [p for p in self.players if not p.out and p.dead_t == 0]
+
+    def say(self, text, frames=90):
+        self.toast, self.toast_t = text, frames
+
+    # ---- girdi
+    def on_focus_out(self, e=None):
+        self.keys.clear()
+        self.pending_release.clear()
+
+    def on_down(self, e):
+        k = e.keysym.lower()
+        if k in self.pending_release:       # X11 oto-tekrarı: bırakma+basma çifti
+            self.pending_release.discard(k)
+            self.keys.add(k)
+            return
+        fresh = k not in self.keys          # tuş basılı tutulursa tekrar saymaz
+        self.keys.add(k)
+        if fresh:
+            self.on_press(k)
+
+    def on_up(self, e):
+        k = e.keysym.lower()
+        self.pending_release.add(k)
+        self.root.after(12, self.finish_release, k)
+
+    def finish_release(self, k):
+        if k in self.pending_release:
+            self.pending_release.discard(k)
+            self.keys.discard(k)
+
+    def on_resize(self, e=None):
+        w = self.cv.winfo_width() or 0
+        h = self.cv.winfo_height() or 0
+        if w >= 100 and h >= 100:
+            self.canvas.fit(w, h, self.settings["fs_crisp"])
+
+    def set_fullscreen(self, on):
+        self.fullscreen = on
+        self.settings["fullscreen"] = on
+        try:
+            if on:
+                self.root.resizable(True, True)
+                self.root.attributes("-fullscreen", True)
+            else:
+                self.root.attributes("-fullscreen", False)
+                self.root.resizable(False, False)
+                self.cv.config(width=W, height=H)
+                self.root.geometry("")
+        except Exception as ex:
+            self.say(f"Tam ekran açılamadı: {ex}", 150)
+            self.fullscreen = self.settings["fullscreen"] = False
+        self.root.after(200, self.on_resize)
+        self.write_save()
+
+    def toggle_fullscreen(self):
+        self.set_fullscreen(not self.fullscreen)
+
+    def on_click(self, e):
+        if self.state != "menu":
+            return
+        mx = (e.x - self.canvas.ox) / self.canvas.f
+        my = (e.y - self.canvas.oy) / self.canvas.f
+        for i, (name, _, _, _) in enumerate(MENU_BUTTONS):
+            x1, y1, x2, y2 = button_rect(i)
+            if x1 <= mx <= x2 and y1 <= my <= y2:
+                if name == "start":
+                    self.snd.play("start")
+                    self.begin_run(self.sel_level)
+                elif name == "shop":
+                    self.snd.play("select")
+                    self.open_shop("menu")
+                else:
+                    self.snd.play("select")
+                    self.open_settings("menu")
+                return
+        for i in range(len(LEVELS)):
+            x1, y1, x2, y2 = card_rect(i)
+            if x1 <= mx <= x2 and y1 <= my <= y2:
+                if self.sel_level == i:
+                    self.snd.play("start")
+                    self.begin_run(i)
+                else:
+                    self.sel_level = i
+                    self.snd.play("select")
+
+    def open_settings(self, came_from):
+        self.settings_from = came_from
+        self.state = "settings"
+
+    def toggle_sound(self):
+        self.settings["sound"] = not self.settings["sound"]
+        self.write_save()
+        self.say("Ses: AÇIK" if self.settings["sound"] else "Ses: KAPALI")
+        if self.settings["sound"]:
+            self.snd.play("select")
+
+    def on_press(self, k):
+        if k == "f11":
+            self.toggle_fullscreen()
+            return
+        if k == "m":
+            self.toggle_sound()
+            return
+        st = self.state
+        if st == "menu":
+            n = len(LEVELS)
+            moved = None
+            if k == "left":
+                moved = max(0, self.sel_level - 1)
+            elif k == "right":
+                moved = min(n - 1, self.sel_level + 1)
+            elif k == "up":
+                moved = self.sel_level - 4 if self.sel_level >= 4 else self.sel_level
+            elif k == "down":
+                moved = self.sel_level + 4 if self.sel_level + 4 < n else self.sel_level
+            elif k.isdigit() and 1 <= int(k) <= n:
+                moved = int(k) - 1
+            if moved is not None:
+                if moved != self.sel_level:
+                    self.snd.play("select")
+                self.sel_level = moved
+            elif k in ENTER_KEYS:
+                self.snd.play("start")
+                self.begin_run(self.sel_level)
+            elif k == "k":
+                self.snd.play("select")
+                self.open_shop("menu")
+            elif k == "s":
+                self.snd.play("select")
+                self.open_settings("menu")
+            elif k == "p":
+                self.settings["players"] = 2 if self.settings["players"] == 1 else 1
+                self.write_save()
+                self.snd.play("equip")
+        elif st == "settings":
+            row = self.set_row
+            if k == "up":
+                self.set_row = (row - 1) % len(SETTINGS_ROWS)
+                self.snd.play("select")
+            elif k == "down":
+                self.set_row = (row + 1) % len(SETTINGS_ROWS)
+                self.snd.play("select")
+            elif k in ("left", "right"):
+                self.settings_adjust(row, -1 if k == "left" else 1)
+            elif k in ENTER_KEYS:
+                self.settings_adjust(row, 0)
+            elif k in ("escape", "s", "backspace"):
+                self.state = self.settings_from
+        elif st == "wizard":
+            self.wizard_key(k)
+        elif st == "controls":
+            if k in ("escape", "return", "kp_enter", "backspace", "s"):
+                self.state = "settings"
+        elif st == "shop":
+            row = self.shop_row
+            n = len(CATS[row][2])
+            if k == "up":
+                self.shop_row = (row - 1) % len(CATS)
+                self.snd.play("select")
+            elif k == "down":
+                self.shop_row = (row + 1) % len(CATS)
+                self.snd.play("select")
+            elif k == "left":
+                self.shop_col[row] = max(0, self.shop_col[row] - 1)
+                self.snd.play("select")
+            elif k == "right":
+                self.shop_col[row] = min(n - 1, self.shop_col[row] + 1)
+                self.snd.play("select")
+            elif k == "tab":
+                self.shop_player = 1 - self.shop_player
+                self.load_shop_cols()
+                self.snd.play("select")
+            elif k in ENTER_KEYS:
+                self.shop_action()
+            elif k in ("escape", "k", "backspace"):
+                self.state = self.shop_from
+        elif st == "play":
+            for pl in self.players:
+                if k in pl.keymap["jump"]:
+                    pl.jump_buf = JUMP_BUFFER
+            if k == "p":
+                self.state = "pause"
+                self.snd.play("pause")
+            elif k == "r":
+                self.restart_level()
+            elif k == "escape":
+                self.state = "menu"
+        elif st == "pause":
+            if k in ("p", "return", "kp_enter"):
+                self.state = "play"
+                self.snd.play("pause")
+            elif k == "s":
+                self.open_settings("pause")
+            elif k == "r":
+                self.restart_level()
+            elif k == "escape":
+                self.state = "menu"
+        elif st == "over":
+            if k in ENTER_KEYS or k == "r":
+                self.restart_level()
+            elif k == "k":
+                self.open_shop("over")
+            elif k == "s":
+                self.open_settings("over")
+            elif k == "escape":
+                self.state = "menu"
+        elif st == "levelwin":
+            if k in ENTER_KEYS:
+                if self.level_idx + 1 < len(LEVELS):
+                    self.start_level(self.level_idx + 1, [p.score for p in self.players])
+                else:
+                    self.state = "menu"
+            elif k == "k":
+                self.open_shop("levelwin")
+            elif k == "s":
+                self.open_settings("levelwin")
+            elif k == "escape":
+                self.state = "menu"
+
+    # ---- ayarlar
+    def settings_adjust(self, row, d):
+        st = self.settings
+        name = SETTINGS_ROWS[row]
+        if name == "sound":
+            self.toggle_sound()
+            return
+        if name == "volume" and d != 0:
+            st["volume"] = max(0, min(100, st["volume"] + d * 10))
+            if self.vol_job is not None:
+                try:
+                    self.root.after_cancel(self.vol_job)
+                except Exception:
+                    pass
+            self.vol_job = self.root.after(250, self.apply_volume)
+        elif name == "engine" and d != 0:
+            choices = ["auto"] + self.snd.engines
+            cur = choices.index(st["engine"]) if st["engine"] in choices else 0
+            st["engine"] = choices[(cur + d) % len(choices)]
+            self.snd.error = ""
+            self.snd.set_engine(st["engine"])
+            self.snd.play("select")
+        elif name == "test" and d == 0:
+            self.sound_test()
+        elif name == "wizard" and d == 0:
+            self.start_wizard()
+            return
+        elif name == "difficulty" and d != 0:
+            st["difficulty"] = max(0, min(2, st["difficulty"] + d))
+        elif name == "players" and d != 0:
+            st["players"] = 2 if st["players"] == 1 else 1
+        elif name == "fullscreen":
+            self.toggle_fullscreen()
+            return
+        elif name == "fsmode" and d != 0:
+            st["fs_crisp"] = not st["fs_crisp"]
+            self.on_resize()
+        elif name == "controls" and d == 0:
+            self.state = "controls"
+            return
+        elif name == "back" and d == 0:
+            self.state = self.settings_from
+            return
+        else:
+            return
+        self.write_save()
+
+    def apply_volume(self):
+        self.vol_job = None
+        self.snd.apply_volume()
+        self.snd.play("select")
+
+    def sound_test(self):
+        self.snd.error = ""
+        self.snd.play("jump")
+        self.root.after(280, lambda: self.snd.play("coin"))
+        self.root.after(600, lambda: self.snd.play("win"))
+        ok, text = self.snd.status()
+        if not self.settings["sound"]:
+            self.say("Ses KAPALI: önce sesi aç (M)", 150)
+        else:
+            self.say(("Test çalındı - " if ok else "SES HATASI - ") + text, 220)
+
+
+    # ---- ses sihirbazı
+    def start_wizard(self):
+        self.settings["sound"] = True
+        self.write_save()
+        self.wiz = {"stage": "intro" if self.snd.engines else "none", "i": 0,
+                    "engines": list(self.snd.engines), "results": {}, "err": "", "report": ""}
+        self.state = "wizard"
+
+    def wizard_play(self, i):
+        w = self.wiz
+        w["i"], w["stage"] = i, "ask"
+        self.snd.error = ""
+        self.snd.set_engine(w["engines"][i])
+        w["err"] = self.snd.test_play("test_tone")
+
+    def wizard_short_demo(self):
+        for delay, name in ((0, "jump"), (500, "coin"), (1000, "stomp_walker"), (1500, "win")):
+            if delay == 0:
+                self.snd.play(name)
+            else:
+                self.root.after(delay, lambda n=name: self.snd.play(n))
+
+    def wizard_finish(self, ok):
+        self.settings["sound_ok"] = ok
+        self.write_save()
+        text = self.snd.report(self.wiz["results"])
+        path = os.path.join(_HERE, "ses_raporu.txt")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+            self.wiz["report"] = path
+        except OSError:
+            self.wiz["report"] = "(rapor dosyası yazılamadı)"
+
+    def end_wizard(self):
+        self.snd.set_engine(self.settings["engine"])
+        self.state = "settings"
+
+    def wizard_key(self, k):
+        w = self.wiz
+        st = w["stage"]
+        if k == "escape":
+            self.end_wizard()
+            return
+        if st == "intro":
+            if k in ENTER_KEYS:
+                self.wizard_play(0)
+        elif st == "ask":
+            eng = w["engines"][w["i"]]
+            if k == "t":
+                self.wizard_play(w["i"])
+            elif k == "e":
+                w["results"][eng] = "uzun ses duyuldu"
+                self.settings["engine"] = eng
+                self.snd.set_engine(eng)
+                w["stage"] = "short"
+                self.wizard_short_demo()
+            elif k == "h":
+                w["results"][eng] = "ses duyulmadi" + (f" (hata: {w['err']})" if w["err"] else "")
+                if w["i"] + 1 < len(w["engines"]):
+                    self.wizard_play(w["i"] + 1)
+                else:
+                    w["stage"] = "fail"
+                    self.wizard_finish(False)
+        elif st == "short":
+            eng = w["engines"][w["i"]]
+            if k == "t":
+                self.wizard_short_demo()
+            elif k == "e":
+                w["results"][eng] += ", kisa oyun sesleri de duyuldu"
+                w["stage"] = "done"
+                self.wizard_finish(True)
+            elif k == "h":
+                w["results"][eng] += ", kisa oyun sesleri DUYULMADI"
+                w["stage"] = "partial"
+                self.wizard_finish(False)
+        elif st in ("done", "partial", "fail", "none"):
+            if k in ENTER_KEYS:
+                self.end_wizard()
+
+    def draw_wizard(self):
+        c, w = self.canvas, self.wiz
+        st = w["stage"]
+        c.create_rectangle(0, 0, W, H, fill="#1b1b3a", outline="")
+        c.create_text(W / 2, 34, text="SES SİHİRBAZI", font=("Arial", 26, "bold"), fill="white")
+        eng = w["engines"][w["i"]] if w["engines"] else None
+        lab = ENGINE_LABELS.get(eng, eng)
+        lines, head = [], ""
+        if st == "none":
+            head = "Bu bilgisayarda ses oynatıcı bulunamadı."
+            lines = ["Linux'ta ses programı kur:  sudo apt install alsa-utils",
+                     "(ya da pulseaudio-utils), sonra oyunu yeniden aç.", "", "ESC: geri"]
+        elif st == "intro":
+            head = "Önce bilgisayarının ses seviyesini aç."
+            lines = ["Hoparlör / kulaklığın doğru cihazda olduğundan emin ol.",
+                     "Sırayla ses motorlarını deneyeceğim; her birinde bir bip çalacak.", "",
+                     "Bulunan motorlar: " + ", ".join(ENGINE_LABELS.get(e, e) for e in w["engines"]),
+                     "", "ENTER: başla        ESC: çık"]
+        elif st == "ask":
+            head = f"Motor {w['i'] + 1}/{len(w['engines'])}:  {lab}"
+            lines = ["Şimdi yaklaşık 1 saniyelik bir bip çalındı (alçaktan yükseğe).", "Duydun mu?", "",
+                     "E = evet, duydum     H = hayır     T = tekrar çal     ESC = çık"]
+            if w["err"]:
+                lines += ["", "Hata: " + w["err"][:80]]
+        elif st == "short":
+            head = f"{lab}: uzun ses geldi!"
+            lines = ["Şimdi kısa oyun sesleri çalındı (zıplama, altın, ezme, zafer).",
+                     "Bunları da duydun mu?", "",
+                     "E = evet     H = hayır     T = tekrar çal"]
+        elif st == "done":
+            head = "Harika! Ses çalışıyor."
+            lines = [f"Seçilen motor: {lab} (kaydedildi)", "", "ENTER: ayarlara dön"]
+        elif st == "partial":
+            head = "Uzun ses var ama kısa oyun sesleri duyulmuyor."
+            lines = ["Bluetooth / HDMI cihazlar kısa sesleri yutabilir.",
+                     "Kablolu hoparlör ya da kulaklık takıp tekrar dene.",
+                     "Rapor: " + w["report"], "", "ENTER: ayarlara dön"]
+        elif st == "fail":
+            head = "Hiçbir motorda ses duyulmadı."
+            lines = ["Kontrol et: sistem sesi açık mı? Sessiz mod? Doğru çıkış cihazı?",
+                     "Windows: Ayarlar > Sistem > Ses > Çıkış cihazını seç.",
+                     "Rapor dosyası (içeriğini bana gönder):", w["report"], "", "ENTER: ayarlara dön"]
+        c.create_text(W / 2, 100, text=head, font=("Arial", 16, "bold"),
+                      fill="#ff8080" if st in ("fail", "none", "partial") else "#ffd966")
+        for i, ln in enumerate(lines):
+            col = "#ff8080" if ln.startswith("Hata:") else "white"
+            c.create_text(W / 2, 148 + i * 28, text=ln, font=("Arial", 13), fill=col)
+
+    # ---- dükkan
+    def equipped_of(self, idx):
+        return self.save["equipped"] if idx == 0 else self.save["equipped2"]
+
+    def load_shop_cols(self):
+        eq = self.equipped_of(self.shop_player)
+        self.shop_col[0] = [o[0] for o in HATS].index(eq["hat"])
+        self.shop_col[1] = [o[0] for o in OVERALLS].index(eq["overall"])
+        self.shop_col[2] = [o[0] for o in BOOTS].index(eq["boots"])
+        self.shop_col[3] = ACC_IDS.index(eq["acc"][0]) if eq["acc"] else 0
+
+    def open_shop(self, came_from):
+        self.shop_from = came_from
+        self.load_shop_cols()
+        self.shop_msg = ""
+        self.state = "shop"
+
+    def shop_action(self):
+        key, _, opts = CATS[self.shop_row]
+        oid, name, _, cost = opts[self.shop_col[self.shop_row]]
+        full = f"{key}:{oid}"
+        bought = False
+        if full not in self.save["owned"]:
+            if self.save["xp"] < cost:
+                self.shop_msg = f"Yeterli XP yok! ({cost - self.save['xp']} XP eksik)"
+                self.shop_msg_t = 120
+                self.snd.play("error")
+                return
+            self.save["xp"] -= cost
+            self.save["owned"].append(full)
+            bought = True
+        eq = self.equipped_of(self.shop_player)
+        if key == "acc":
+            accs = eq["acc"]
+            if oid in accs and not bought:
+                accs.remove(oid)
+                self.shop_msg = f"{name} çıkarıldı."
+            else:
+                if oid not in accs:
+                    accs.append(oid)
+                self.shop_msg = f"{name} satın alındı ve takıldı!" if bought else f"{name} takıldı."
+                if len(accs) > MAX_ACC:
+                    dropped = accs.pop(0)
+                    dn = next(o[1] for o in ACCS if o[0] == dropped)
+                    self.shop_msg += f" ({dn} çıkarıldı, en fazla {MAX_ACC})"
+        else:
+            eq[key] = oid
+            self.shop_msg = f"{name} satın alındı!" if bought else f"{name} seçildi."
+        self.shop_msg_t = 120
+        self.snd.play("buy" if bought else "equip")
+        self.write_save()
+
+    # ---- fizik
+    def solid(self, c, r):
+        if c < 0 or c >= self.cols:
+            return True
+        if r < 0 or r >= ROWS:
+            return False
+        return self.grid[r][c] in SOLID
+
+    def free(self, x, y, w, h):
+        for r in range(int(y // TILE), int((y + h - 1) // TILE) + 1):
+            for c in range(int(x // TILE), int((x + w - 1) // TILE) + 1):
+                if self.solid(c, r):
+                    return False
+        return True
+
+    def move_x(self, e):
+        e.x += e.vx
+        hit = False
+        top, bot = int(e.y // TILE), int((e.y + e.h - 1) // TILE)
+        left, right = int(e.x // TILE), int((e.x + e.w - 1) // TILE)
+        for r in range(top, bot + 1):
+            for c in range(left, right + 1):
+                if self.solid(c, r):
+                    if e.vx > 0:
+                        e.x = c * TILE - e.w
+                    elif e.vx < 0:
+                        e.x = (c + 1) * TILE
+                    hit = True
+        return hit
+
+    def nudge(self, e, c, r):
+        """Kafa bloğun köşesine hafif takılırsa yana kaydır (köşe affı)."""
+        bl, br = c * TILE, (c + 1) * TILE
+        over_r = e.x + e.w - bl
+        over_l = br - e.x
+        if 0 < over_r <= 10 and self.free(bl - e.w, e.y, e.w, e.h):
+            e.x = bl - e.w
+            return True
+        if 0 < over_l <= 10 and self.free(br, e.y, e.w, e.h):
+            e.x = br
+            return True
+        return False
+
+    def move_y(self, e, is_player=False):
+        e.y += e.vy
+        e.on_ground = False
+        top, bot = int(e.y // TILE), int((e.y + e.h - 1) // TILE)
+        left, right = int(e.x // TILE), int((e.x + e.w - 1) // TILE)
+        for r in range(top, bot + 1):
+            for c in range(left, right + 1):
+                if self.solid(c, r):
+                    if e.vy > 0:
+                        e.y = r * TILE - e.h
+                        e.on_ground = True
+                    elif e.vy < 0:
+                        if is_player and self.nudge(e, c, r):
+                            continue
+                        e.y = (r + 1) * TILE
+                        if is_player:
+                            self.bump(c, r)
+                    e.vy = 0
+        if not e.on_ground and e.vy >= 0:
+            # yerdeyken 1 pikselden az gömülme "havada" sayılmasın (zemin titremesini önler)
+            fr = int((e.y + e.h) // TILE)
+            if (e.y + e.h) - fr * TILE < 1.5 and any(
+                    self.solid(cc, fr) for cc in range(left, right + 1)):
+                e.y = fr * TILE - e.h
+                e.on_ground = True
+                e.vy = 0
+
+    def bump(self, c, r):
+        """Oyuncu bloğa kafayı vurdu."""
+        ch = self.grid[r][c]
+        if ch == "?":
+            self.grid[r][c] = "U"
+            xp = int(random.randint(15, 45) * self.diff["xp"])
+            self.save["xp"] += xp
+            self.write_save()
+            self.bumped[(c, r)] = BUMP_FRAMES
+            self.popups.append([f"+{xp} XP", c * TILE + TILE / 2, r * TILE - 8, 55, "#7df9ff"])
+            self.snd.play("xp")
+        elif ch == "B":
+            self.bumped[(c, r)] = BUMP_FRAMES
+            self.snd.play("brick")
+        elif ch == "U":
+            self.bumped[(c, r)] = BUMP_FRAMES
+            self.snd.play("bump")
+
+    def puff(self, x, y, n):
+        for _ in range(n):
+            self.particles.append([x + random.uniform(-6, 6), y - 2,
+                                   random.uniform(-1.2, 1.2), random.uniform(-1.0, -0.2), 18])
+
+    def tiles_touching(self, e):
+        for r in range(int(e.y // TILE), int((e.y + e.h - 1) // TILE) + 1):
+            for c in range(int(e.x // TILE), int((e.x + e.w - 1) // TILE) + 1):
+                if 0 <= r < ROWS and 0 <= c < self.cols:
+                    yield c, r
+
+    def visible(self, e):
+        x = e.cx if e.kind == "plant" else e.x
+        return self.cam - 40 < x < self.cam + W + 40
+
+    # ---- güncelleme
+    def update(self):
+        self.frame += 1
+        for pop in self.popups:
+            pop[2] -= 0.8
+            pop[3] -= 1
+        self.popups = [p for p in self.popups if p[3] > 0]
+        for pt in self.particles:
+            pt[0] += pt[2]
+            pt[1] += pt[3]
+            pt[4] -= 1
+        self.particles = [p for p in self.particles if p[4] > 0]
+        for k in list(self.bumped):
+            self.bumped[k] -= 1
+            if self.bumped[k] <= 0:
+                del self.bumped[k]
+        if self.shop_msg_t > 0:
+            self.shop_msg_t -= 1
+        if self.toast_t > 0:
+            self.toast_t -= 1
+        if self.state != "play":
+            return
+        for pl in self.players:
+            self.update_player(pl)
+            if self.state != "play":
+                return
+        self.enforce_separation()
+        self.update_enemies()
+        self.update_camera()
+
+    def update_player(self, pl):
+        if pl.out:
+            return
+        if pl.dead_t > 0:
+            pl.dead_t -= 1
+            if pl.dead_t == 0:
+                self.spawn(pl)
+                if len(self.players) == 1:
+                    self.look = 0.0
+                    self.snap_camera()
+            return
+        if pl.invuln > 0:
+            pl.invuln -= 1
+
+        km = pl.keymap
+        left = bool(self.keys & km["left"])
+        right = bool(self.keys & km["right"])
+        run = bool(self.keys & km["run"])
+        pl.jump_held = bool(self.keys & km["jump"])
+
+        # --- yatay hareket: ivmelenme + sürtünme + koşma
+        dirx = (1 if right else 0) - (1 if left else 0)
+        maxv = RUN if run else WALK
+        if dirx:
+            acc = ACCEL if pl.on_ground else AIR_ACCEL
+            if pl.vx * dirx < 0:                # ters yöne dönüş: frenle
+                acc *= 2.2
+            target = dirx * maxv
+            if pl.vx < target:
+                pl.vx = min(pl.vx + acc, target)
+            elif pl.vx > target:
+                pl.vx = max(pl.vx - acc, target)
+            pl.face = dirx
+        else:
+            fr = FRICTION if pl.on_ground else AIR_FRICTION
+            if abs(pl.vx) <= fr:
+                pl.vx = 0.0
+            else:
+                pl.vx -= fr if pl.vx > 0 else -fr
+
+        # --- zıplama: coyote süresi + tuş hafızası + değişken yükseklik + çift zıplama
+        if pl.on_ground:
+            pl.coyote = COYOTE
+            pl.air_jumps = MAX_AIR_JUMPS
+        elif pl.coyote > 0:
+            pl.coyote -= 1
+        if pl.jump_buf > 0:
+            pl.jump_buf -= 1
+        if pl.jump_buf > 0 and pl.coyote > 0:
+            pl.vy = JUMP - min(abs(pl.vx), RUN) * 0.12    # koşarak zıplayınca biraz daha yüksek
+            pl.on_ground = False
+            pl.coyote = 0
+            pl.jump_buf = 0
+            self.snd.play("jump")
+            self.puff(pl.x + pl.w / 2, pl.y + pl.h, 3)
+        elif pl.jump_buf > 0 and pl.coyote <= 0 and pl.air_jumps > 0:
+            pl.vy = DOUBLE_JUMP
+            pl.air_jumps -= 1
+            pl.jump_buf = 0
+            self.snd.play("double_jump")
+            self.puff(pl.x + pl.w / 2, pl.y + pl.h, 6)
+        if not pl.jump_held and pl.vy < -5:               # tuşu bırakınca kısa zıpla
+            pl.vy = -5
+
+        pl.vy = min(pl.vy + (GRAVITY if pl.vy < 0 else FALL_GRAVITY), MAX_FALL)
+        fall_speed = pl.vy
+        was_ground = pl.on_ground
+        if self.move_x(pl):
+            pl.vx = 0.0
+        self.move_y(pl, True)
+        if pl.on_ground and not was_ground and fall_speed > 6:
+            self.puff(pl.x + pl.w / 2, pl.y + pl.h, 4)
+        if pl.on_ground and abs(pl.vx) > 5 and self.frame % 7 == 0:
+            self.puff(pl.x + pl.w / 2 - pl.face * 8, pl.y + pl.h, 1)
+
+        # --- altın ve bayrak
+        reached_flag = pl.x + pl.w / 2 > (self.cols - 4) * TILE + 20     # direği geçti
+        for c, r in self.tiles_touching(pl):
+            ch = self.grid[r][c]
+            if ch == "F":
+                reached_flag = True
+            if ch == "o":
+                self.grid[r][c] = "."
+                pl.coins += 1
+                pl.score += 100
+                self.snd.play("coin")
+
+        if reached_flag:
+            for q in self.players:
+                if not q.out:
+                    q.score += q.lives * 500
+            self.write_save()
+            self.state = "levelwin"
+            self.snd.play("win")
+            return
+
+        # --- kontrol noktası ve güvenli konum
+        for col in self.checks:
+            px = col * TILE + 6
+            if pl.x > col * TILE and (self.checkpoint is None or px > self.checkpoint):
+                self.checkpoint = px
+                self.say("Kontrol noktası!", 80)
+                self.snd.play("checkpoint")
+        if pl.on_ground:
+            rr = int((pl.y + pl.h) // TILE)
+            if (self.solid(int((pl.x + 2) // TILE), rr)
+                    and self.solid(int((pl.x + pl.w - 3) // TILE), rr)):
+                pl.safe_x, pl.safe_y = pl.x, pl.y
+
+        # --- uçuruma / lava'ya düştü
+        if pl.y > H + 60:
+            self.kill_player(pl)
+
+    def enforce_separation(self):
+        """2 oyuncu: ileri giden, gerideki oyuncudan çok uzaklaşamaz (ikisi de ekranda kalır)."""
+        al = self.alive_players()
+        if len(al) == 2:
+            a, b = sorted(al, key=lambda q: q.x)
+            if b.x - a.x > MAX_SEP:
+                b.x = a.x + MAX_SEP
+                if b.vx > 0:
+                    b.vx = 0.0
+
+    def kill_player(self, pl, by=None):
+        if pl.out or pl.dead_t > 0:
+            return
+        pl.lives -= 1
+        pl.vx = pl.vy = 0.0
+        if pl.lives <= 0:
+            pl.out = True
+        else:
+            pl.dead_t = 70
+        if all(p.out for p in self.players):
+            self.state = "over"
+            self.snd.play("over")
+        else:
+            snd = DIE_SOUNDS.get(by, "die") if by else "die"
+            if snd:
+                self.snd.play(snd)
+            if len(self.players) > 1:
+                self.say(f"Oyuncu {pl.idx + 1} öldü!" if not pl.out
+                         else f"Oyuncu {pl.idx + 1} elendi!", 70)
+
+    def enemy_rect(self, e):
+        k = e.kind
+        if k == "plant":
+            if e.ext <= 6:
+                return None
+            return (e.cx - 16, e.top - e.ext + 3, 32, e.ext)
+        if k == "lavaball":
+            return (e.x, e.y, e.w, e.h) if (e.state == "fly" and e.y < H) else None
+        return (e.x, e.y, e.w, e.h)
+
+    def update_enemies(self):
+        al = self.alive_players()
+        for e in self.enemies:
+            if not e.alive:
+                if e.squash > 0:
+                    e.squash -= 1
+                continue
+            if not al:
+                continue
+            ex = e.cx if e.kind == "plant" else e.x
+            target = min(al, key=lambda p: abs(p.x - ex))
+            if abs(ex - target.x) > W:          # uzaktakiler uyur
+                continue
+            self.update_enemy(e, target, al)
+            if not e.alive:
+                continue
+            r = self.enemy_rect(e)
+            if r is None:
+                continue
+            for pl in al:
+                if pl.dead_t > 0 or pl.out:
+                    continue
+                if hit_rect(pl, r):
+                    stomp = (e.kind not in UNSTOMPABLE and pl.vy > 0
+                             and (pl.y + pl.h - r[1]) < 24)
+                    if stomp:                   # üstüne bastı
+                        e.alive = False
+                        e.squash = 30
+                        pl.vy = -11 if pl.jump_held else -8
+                        pl.score += 200
+                        pl.air_jumps = MAX_AIR_JUMPS
+                        self.snd.play("stomp_" + e.kind)
+                        self.puff(e.x + e.w / 2, e.y + e.h, 3)
+                        break
+                    elif pl.invuln == 0:
+                        self.kill_player(pl, e.kind)
+        self.enemies = [e for e in self.enemies if e.alive or e.squash > 0]
+
+    def update_enemy(self, e, target, al):
+        k = e.kind
+        if k == "flyer":
+            e.x += e.dir * e.speed
+            e.phase += 0.06
+            e.y = e.base_y + math.sin(e.phase) * 40
+            if e.x - e.start_x > 120:
+                e.dir = -1
+            elif e.x - e.start_x < -120:
+                e.dir = 1
+        elif k == "ghost":
+            self.update_ghost(e, target)
+        elif k == "lavaball":
+            self.update_lava(e)
+        elif k == "plant":
+            self.update_plant(e, al)
+        else:
+            self.update_walker(e, target, al)
+
+    def update_ghost(self, e, target):
+        """Utangaç hayalet: bakınca donar, arkanı dönünce üstüne süzülür."""
+        ex, px = e.x + e.w / 2, target.x + target.w / 2
+        facing = (ex - px) * target.face > 0       # oyuncu hayalete bakıyor
+        if e.boo_cd > 0:
+            e.boo_cd -= 1
+        if facing:
+            e.chasing = False
+        else:
+            if not e.chasing and e.boo_cd == 0 and self.visible(e):
+                self.snd.play("ghost_boo")
+                e.boo_cd = 240
+            e.chasing = True
+        if e.chasing:
+            dx = px - ex
+            dy = (target.y + target.h / 2) - (e.y + e.h / 2)
+            dist = max(1.0, math.hypot(dx, dy))
+            e.x += dx / dist * e.speed
+            e.y += dy / dist * e.speed * 0.7
+            e.y = max(40, min(380, e.y))
+
+    def update_lava(self, e):
+        if e.state == "wait":
+            e.t -= 1
+            if e.t <= 0:
+                e.state = "fly"
+                e.vy = -(15.5 + random.random() * 2.5)
+                e.y = H + 10
+                if self.visible(e):
+                    self.snd.play("lava_pop")
+        else:
+            e.vy += 0.45
+            e.y += e.vy
+            if e.y > H + 30 and e.vy > 0:
+                e.state = "wait"
+                e.t = random.randint(50, 130)
+
+    def update_plant(self, e, al):
+        """Borudan çıkan etobur bitki: yanında biri varsa çıkmaz."""
+        near = any(abs(p.x + p.w / 2 - e.cx) < 60 and p.y + p.h > e.top - 70 for p in al)
+        cycle = 230
+        if not ((e.t % cycle) < 100 and near):
+            e.t += 1
+        ph = e.t % cycle
+        if ph < 100:
+            e.ext = 0
+        elif ph < 120:
+            e.ext = 52 * (ph - 100) / 20
+        elif ph < 190:
+            e.ext = 52
+        elif ph < 210:
+            e.ext = 52 * (1 - (ph - 190) / 20)
+        else:
+            e.ext = 0
+        if ph == 100 and self.visible(e):
+            self.snd.play("plant_chomp")
+
+    def update_walker(self, e, target, al):
+        k = e.kind
+        s = e.speed
+        if k == "penguin":
+            if e.dash > 0:
+                e.dash -= 1
+                s = e.speed * 3.2
+            elif e.cool > 0:
+                e.cool -= 1
+            elif e.on_ground and abs(target.x - e.x) < 240 and abs(target.y - e.y) < 50:
+                e.dir = 1 if target.x > e.x else -1
+                e.dash = 40
+                e.cool = 150
+                if self.visible(e):
+                    self.snd.play("penguin_dash")
+        elif k == "bomb":
+            if e.state == "walk":
+                if e.on_ground and any(abs(p.x - e.x) < 100 and abs(p.y - e.y) < 70 for p in al):
+                    e.state = "lit"
+                    e.fuse = 70
+                    if self.visible(e):
+                        self.snd.play("bomb_fuse")
+            else:
+                s = 0.0
+                e.fuse -= 1
+                if e.fuse <= 0:
+                    self.explode(e)
+                    return
+        e.vx = e.dir * s
+        e.vy = min(e.vy + GRAVITY, MAX_FALL)
+        if self.move_x(e):
+            e.dir = -e.dir
+        self.move_y(e)
+        if k == "hopper" and e.on_ground:
+            e.timer -= 1
+            if e.timer <= 0:
+                e.vy = -11
+                e.timer = random.randint(50, 90)
+        if e.on_ground and s > 0 and not (k == "penguin" and e.dash > 0):
+            ahead = e.x + (e.w + 1 if e.dir > 0 else -1)
+            if not self.solid(int(ahead // TILE), int((e.y + e.h + 1) // TILE)):
+                e.dir = -e.dir                  # uçurumdan dönsün
+        if e.y > H + 100:
+            e.alive = False
+
+    def explode(self, e):
+        e.alive = False
+        e.exploded = True
+        e.squash = 24
+        if self.visible(e):
+            self.snd.play("bomb_boom")
+        cx, cy = e.x + e.w / 2, e.y + e.h / 2
+        for pl in self.players:
+            if pl.out or pl.dead_t > 0 or pl.invuln > 0:
+                continue
+            if math.hypot(pl.x + pl.w / 2 - cx, pl.y + pl.h / 2 - cy) < 78:
+                self.kill_player(pl, "bomb")
+
+    def update_camera(self):
+        al = [p for p in self.players if not p.out]
+        if not al:
+            return
+        if len(self.players) == 1:
+            p = al[0]
+            self.look += (p.face * 70 * (1 if abs(p.vx) > 0.5 else 0.4) - self.look) * 0.05
+            target = p.x - W * 0.4 + self.look
+        else:
+            live = [p for p in al if p.dead_t == 0] or al
+            target = sum(p.x for p in live) / len(live) + 14 - W / 2
+        self.cam += (target - self.cam) * 0.15
+        self.cam = max(0, min(self.cols * TILE - W, self.cam))
+
+    # ---- dokular
+    def get_tile(self, ch, row, col):
+        """(PhotoImage, y_kayması) döner. Dokular önbelleğe alınır."""
+        th, tkey = self.theme, self.spec["theme"]
+        if ch == "#":
+            lo = not self.solid(col - 1, row)
+            ro = not self.solid(col + 1, row)
+            grass = row == 10 and not self.solid(col, row - 1)
+            var = (col + row) % 3
+            key = ("g" if grass else "d", tkey, var, lo, ro)
+            if key not in self.tiles:
+                self.tiles[key] = make_ground_tile(th, var, grass, lo, ro).to_image(th["sky"])
+            return self.tiles[key], (-GRASS_PAD if grass else 0)
+        if ch == "B":
+            key = ("B", tkey)
+            if key not in self.tiles:
+                self.tiles[key] = make_brick_tile(th).to_image(th["sky"])
+        elif ch == "S":
+            key = ("S", tkey)
+            if key not in self.tiles:
+                self.tiles[key] = make_stone_tile(th).to_image(th["sky"])
+        elif ch == "?":
+            pulse = (self.frame // 20) % 2
+            key = ("q", pulse)
+            if key not in self.tiles:
+                self.tiles[key] = make_q_tile(pulse, False).to_image(th["sky"])
+        elif ch == "U":
+            key = ("u",)
+            if key not in self.tiles:
+                self.tiles[key] = make_q_tile(0, True).to_image(th["sky"])
+        else:   # "T"
+            top = row == 0 or self.grid[row - 1][col] != "T"
+            left = col in self.pipe_left
+            key = ("T", tkey, top, left)
+            if key not in self.tiles:
+                self.tiles[key] = make_pipe_tile(top, left, th["pipe"]).to_image(th["sky"])
+        return self.tiles[key], 0
+
+    def prewarm(self):
+        """Bölümdeki tüm doku çeşitlerini oyun başlamadan üret (takılma olmasın)."""
+        saved = self.frame
+        for pulse_frame in (0, 20):
+            self.frame = pulse_frame
+            for row in range(ROWS):
+                for col in range(self.cols):
+                    ch = self.grid[row][col]
+                    if ch in "#BS?UT":
+                        self.get_tile(ch, row, col)
+        self.frame = saved
+
+    # ---- çizim: dünya
+    def draw_coin(self, sx, sy, col):
+        c = self.canvas
+        bob = math.sin(self.frame * 0.08 + col * 0.7) * 2
+        y = sy + bob
+        c.create_oval(sx + 8, y + 8, sx + 32, y + 32, fill="#f5b800", outline="#a06800", width=2)
+        c.create_oval(sx + 11, y + 11, sx + 29, y + 29, outline="#ffd84a")
+        c.create_text(sx + 20, y + 20, text="C", font=("Arial", 13, "bold"), fill="white")
+
+    def draw_flag(self, sx, sy, row):
+        c = self.canvas
+        c.create_rectangle(sx + 18, sy, sx + 22, sy + TILE, fill="#eeeeee", outline="#888888")
+        if row == 1:
+            wave_y = math.sin(self.frame * 0.12) * 3
+            c.create_polygon(sx + 22, sy + 4, sx + 40, sy + 8 + wave_y, sx + 54, sy + 16,
+                             sx + 40, sy + 22 - wave_y, sx + 22, sy + 28,
+                             fill="#e02020", outline="#801010")
+        elif row == 0:
+            c.create_oval(sx + 14, sy + 2, sx + 26, sy + 14, fill="#ffd700", outline="#b8860b")
+
+    def draw_checkpoints(self):
+        c = self.canvas
+        for col in self.checks:
+            sx = col * TILE - int(self.cam)
+            if -60 < sx < W + 20:
+                reached = self.checkpoint is not None and self.checkpoint >= col * TILE + 6
+                c.create_rectangle(sx + 19, 10 * TILE - 58, sx + 22, 10 * TILE,
+                                   fill="#cccccc", outline="#777777")
+                c.create_polygon(sx + 22, 10 * TILE - 58, sx + 42, 10 * TILE - 50,
+                                 sx + 22, 10 * TILE - 42,
+                                 fill="#2ecc40" if reached else "#ffd84a", outline="#555555")
+
+    def draw_background(self):
+        c, th = self.canvas, self.theme
+        cam = self.cam
+        c.create_rectangle(0, 0, W, H, fill=th["sky"], outline="")
+        deco = th["deco"]
+        if deco == "hills":
+            for i in range(14):
+                cx = i * 380 + (i % 3) * 60 - cam * 0.25
+                if -320 < cx < W + 40:
+                    w, h = 260 + (i % 3) * 60, 90 + (i % 2) * 30
+                    c.create_arc(cx, 400 - h, cx + w, 400 + h, start=0, extent=180,
+                                 fill="#3fa84a", outline="")
+            for i in range(14):
+                cx = i * 300 + 120 + (i % 2) * 50 - cam * 0.5
+                if -260 < cx < W + 40:
+                    w, h = 200 + (i % 2) * 50, 60 + (i % 3) * 14
+                    c.create_arc(cx, 400 - h, cx + w, 400 + h, start=0, extent=180,
+                                 fill="#58c458", outline="")
+            for i in range(14):
+                cx = i * 430 + 100 - cam * 0.5
+                cy = 50 + (i % 3) * 38
+                if -120 < cx < W + 120:
+                    for dx, dw in ((0, 60), (30, 70), (60, 60)):
+                        c.create_oval(cx + dx, cy, cx + dx + dw, cy + 34, fill="white", outline="")
+        elif deco == "cave":
+            for i in range(60):
+                sx = (i * 97 - cam * 0.3) % W
+                sy = (i * 53) % 260
+                col = "white" if (i + self.frame // 20) % 5 else "#8888cc"
+                c.create_rectangle(sx, sy, sx + 2, sy + 2, fill=col, outline="")
+            for i in range(10):
+                sx = (i * 90 - cam * 0.6) % 900 - 50
+                h = 40 + (i % 3) * 22
+                c.create_polygon(sx, 0, sx + 56, 0, sx + 28, h, fill="#1c1c3c", outline="")
+        elif deco == "lava":
+            pillar = th.get("pillar", "#3a1212")
+            for i in range(10):
+                bx = (i * 300 + 60 - cam * 0.4) % (W + 200) - 100
+                c.create_rectangle(bx, 140 + (i % 3) * 30, bx + 70, 400, fill=pillar, outline="")
+                c.create_rectangle(bx + 24, 170 + (i % 3) * 30, bx + 34, 190 + (i % 3) * 30,
+                                   fill="#ffb000" if (self.frame // 15 + i) % 3 else "#7a3a10",
+                                   outline="")
+            for x in range(0, W + 40, 40):
+                off = math.sin(self.frame * 0.1 + x * 0.05) * 4
+                c.create_rectangle(x, 412 + off, x + 40, H, fill="#ff5a10", outline="")
+                c.create_rectangle(x, 412 + off, x + 40, 420 + off, fill="#ffb000", outline="")
+        elif deco == "snow":
+            for i in range(10):
+                cx = i * 340 + 60 - cam * 0.2
+                if -360 < cx < W + 60:
+                    w, h = 300 + (i % 3) * 60, 150 + (i % 2) * 40
+                    c.create_polygon(cx, 400, cx + w / 2, 400 - h, cx + w, 400,
+                                     fill="#86abd2", outline="")
+                    off = 44 * (w / 2) / h
+                    c.create_polygon(cx + w / 2, 400 - h, cx + w / 2 - off, 400 - h + 44,
+                                     cx + w / 2 + off, 400 - h + 44, fill="#f4fbff", outline="")
+            for i in range(45):
+                fx = (i * 97 + math.sin(self.frame * 0.02 + i) * 18 - cam * 0.5) % W
+                fy = (i * 31 + self.frame * (0.7 + (i % 3) * 0.35)) % H
+                c.create_oval(fx, fy, fx + 3, fy + 3, fill="white", outline="")
+        elif deco == "desert":
+            c.create_oval(610, 28, 740, 158, fill="#ffe27a", outline="")
+            c.create_oval(630, 48, 720, 138, fill="#fff3b0", outline="")
+            for i in range(8):
+                bx = i * 520 + 100 - cam * 0.3
+                if -280 < bx < W + 40:
+                    c.create_polygon(bx, 400, bx + 130, 276, bx + 260, 400,
+                                     fill="#d9a441", outline="")
+                    c.create_polygon(bx + 130, 276, bx + 260, 400, bx + 130, 400,
+                                     fill="#b8832c", outline="")
+            for i in range(12):
+                dx = i * 300 - cam * 0.5
+                if -320 < dx < W + 40:
+                    c.create_arc(dx, 350, dx + 340, 450, start=0, extent=180,
+                                 fill="#e8b85a", outline="")
+        elif deco == "haunted":
+            c.create_oval(590, 36, 690, 136, fill="#f4efd0", outline="")
+            c.create_oval(612, 60, 632, 80, fill="#d9d3b0", outline="")
+            c.create_oval(650, 90, 672, 112, fill="#d9d3b0", outline="")
+            for i in range(30):
+                sx = (i * 131 - cam * 0.2) % W
+                sy = (i * 47) % 200
+                c.create_rectangle(sx, sy, sx + 2, sy + 2, fill="#a8a0d0", outline="")
+            for i in range(10):
+                tx = (i * 260 + 80 - cam * 0.4) % (W + 260) - 130
+                c.create_rectangle(tx, 330, tx + 10, 400, fill="#0c0818", outline="")
+                c.create_line(tx + 5, 345, tx - 26, 302, fill="#0c0818", width=4)
+                c.create_line(tx + 5, 352, tx + 36, 312, fill="#0c0818", width=4)
+                c.create_line(tx + 5, 335, tx + 8, 296, fill="#0c0818", width=4)
+
+    def draw_plant(self, e):
+        """Pipoya gizlenen bitki. Borudan ÖNCE çizilir, böylece boru gövdesi onu örter."""
+        c = self.canvas
+        cx = int(e.cx - self.cam)
+        if cx < -60 or cx > W + 60:
+            return
+        top, ext = e.top, e.ext
+        hy = top - ext + 20
+        c.create_rectangle(cx - 5, hy, cx + 5, top + 18, fill="#2a9a2a", outline="#146014")
+        c.create_polygon(cx - 5, hy + 18, cx - 26, hy + 8, cx - 8, hy + 30,
+                         fill="#2fb02f", outline="#146014")
+        c.create_polygon(cx + 5, hy + 18, cx + 26, hy + 8, cx + 8, hy + 30,
+                         fill="#2fb02f", outline="#146014")
+        c.create_oval(cx - 17, hy - 17, cx + 17, hy + 17, fill="#d82020", outline="#7a0a0a", width=2)
+        for dx, dy, r in ((-10, -10, 3), (6, -12, 3), (-2, 8, 3), (11, 4, 2)):
+            c.create_oval(cx + dx - r, hy + dy - r, cx + dx + r, hy + dy + r, fill="white", outline="")
+        if (self.frame // 8) % 2 == 0:                      # ağzı açık: dişli
+            c.create_oval(cx - 13, hy - 3, cx + 13, hy + 11, fill="#2a0508", outline="")
+            for tx in (-10, -3, 4):
+                c.create_polygon(cx + tx, hy - 3, cx + tx + 6, hy - 3, cx + tx + 3, hy + 4,
+                                 fill="white", outline="")
+        else:
+            c.create_line(cx - 13, hy + 3, cx + 13, hy + 3, fill="#2a0508", width=3)
+
+    def draw_enemy(self, e):
+        c = self.canvas
+        k = e.kind
+        if k == "plant":
+            return
+        x, y = int(e.x - self.cam), int(e.y)
+        if x < -80 or x > W + 80:
+            return
+        if not e.alive:
+            if e.exploded:                                  # bomba patlaması
+                t = 24 - e.squash
+                r = 14 + t * 3.4
+                cx, cy = x + 16, y + 16
+                c.create_oval(cx - r, cy - r, cx + r, cy + r, fill="#ff6a00", outline="#ffb000", width=3)
+                c.create_oval(cx - r * 0.66, cy - r * 0.66, cx + r * 0.66, cy + r * 0.66,
+                              fill="#ffb000", outline="")
+                c.create_oval(cx - r * 0.33, cy - r * 0.33, cx + r * 0.33, cy + r * 0.33,
+                              fill="#fff3a0", outline="")
+                return
+            col = {"walker": "#8b4513", "spiky": "#c02020", "hopper": "#30a030",
+                   "flyer": "#7030a0", "penguin": "#23233a", "bomb": "#222222"}.get(k, "#555555")
+            c.create_rectangle(x, y + e.h - 8, x + 32, y + e.h, fill=col, outline="black")
+            return
+        if k == "walker":
+            sh = 3 if (self.frame // 8) % 2 else 0
+            c.create_oval(x, y, x + 32, y + 26, fill="#8b4513", outline="#3a1a05")
+            c.create_rectangle(x + 2 + sh, y + 22, x + 14 + sh, y + 32, fill="#3a1a05", outline="")
+            c.create_rectangle(x + 18 - sh, y + 22, x + 30 - sh, y + 32, fill="#3a1a05", outline="")
+            self._eyes(x, y + 7)
+        elif k == "spiky":
+            for sx in (2, 12, 22):
+                c.create_polygon(x + sx, y + 10, x + sx + 4, y - 4, x + sx + 8, y + 10,
+                                 fill="#eeeeee", outline="#777777")
+            c.create_oval(x, y + 4, x + 32, y + 28, fill="#c02020", outline="#601010")
+            c.create_rectangle(x + 3, y + 24, x + 13, y + 32, fill="#601010", outline="")
+            c.create_rectangle(x + 19, y + 24, x + 29, y + 32, fill="#601010", outline="")
+            self._eyes(x, y + 11)
+            c.create_line(x + 5, y + 9, x + 14, y + 13, fill="black", width=2)
+            c.create_line(x + 27, y + 9, x + 18, y + 13, fill="black", width=2)
+        elif k == "hopper":
+            air = not e.on_ground
+            c.create_oval(x, y + 8, x + 32, y + 30, fill="#30a030", outline="#106010")
+            c.create_oval(x + 3, y, x + 15, y + 12, fill="white", outline="#106010")
+            c.create_oval(x + 17, y, x + 29, y + 12, fill="white", outline="#106010")
+            c.create_oval(x + 7, y + 3, x + 11, y + 9, fill="black", outline="")
+            c.create_oval(x + 21, y + 3, x + 25, y + 9, fill="black", outline="")
+            leg = 4 if air else 0
+            c.create_rectangle(x + 1, y + 28, x + 11, y + 32 + leg, fill="#106010", outline="")
+            c.create_rectangle(x + 21, y + 28, x + 31, y + 32 + leg, fill="#106010", outline="")
+        elif k == "flyer":
+            up = (self.frame // 8) % 2 == 0
+            wy = y + (2 if up else 20)
+            c.create_polygon(x + 10, y + 14, x - 8, wy, x + 8, y + 22,
+                             fill="#5a2090", outline="#2a0a50")
+            c.create_polygon(x + 22, y + 14, x + 40, wy, x + 24, y + 22,
+                             fill="#5a2090", outline="#2a0a50")
+            c.create_oval(x + 8, y + 6, x + 24, y + 26, fill="#7030a0", outline="#2a0a50")
+            c.create_oval(x + 11, y + 12, x + 15, y + 16, fill="red", outline="")
+            c.create_oval(x + 17, y + 12, x + 21, y + 16, fill="red", outline="")
+            c.create_polygon(x + 10, y + 8, x + 12, y, x + 15, y + 8, fill="#7030a0", outline="")
+            c.create_polygon(x + 17, y + 8, x + 20, y, x + 22, y + 8, fill="#7030a0", outline="")
+        elif k == "penguin":
+            d = e.dir
+            sh = 3 if (self.frame // 6) % 2 else 0
+            if e.dash > 0:                                  # hız çizgileri
+                for off in (6, 14, 22):
+                    c.create_line(x + 16 - d * 22, y + off, x + 16 - d * 36, y + off,
+                                  fill="white", width=2)
+            c.create_oval(x, y, x + 32, y + 30, fill="#23233a", outline="#0b0b18")
+            c.create_oval(x + 7, y + 8, x + 25, y + 30, fill="#f4f4f8", outline="")
+            bx = x + 16 + d * 6
+            c.create_polygon(bx, y + 10, bx + d * 10, y + 14, bx, y + 18,
+                             fill="#ff9a1a", outline="#a05a00")
+            c.create_oval(x + 8, y + 4, x + 15, y + 12, fill="white", outline="")
+            c.create_oval(x + 17, y + 4, x + 24, y + 12, fill="white", outline="")
+            c.create_oval(x + 10 + d, y + 6, x + 13 + d, y + 11, fill="black", outline="")
+            c.create_oval(x + 19 + d, y + 6, x + 22 + d, y + 11, fill="black", outline="")
+            c.create_rectangle(x + 4 + sh, y + 28, x + 14 + sh, y + 32, fill="#ff9a1a", outline="")
+            c.create_rectangle(x + 18 - sh, y + 28, x + 28 - sh, y + 32, fill="#ff9a1a", outline="")
+        elif k == "bomb":
+            lit = e.state == "lit"
+            flash = lit and (self.frame // 4) % 2 == 0
+            c.create_oval(x, y + 6, x + 32, y + 32, fill="#d82020" if flash else "#1e1e1e",
+                          outline="#000000", width=2)
+            c.create_oval(x + 5, y + 10, x + 12, y + 17, fill="#666666", outline="")
+            c.create_line(x + 16, y + 6, x + 22, y - 1, fill="#8a5a1a", width=3)
+            sp = 5 if (self.frame // 3) % 2 else 3
+            c.create_polygon(x + 22, y - 1 - sp, x + 22 + sp // 2 + 1, y - 1, x + 22, y - 1 + sp,
+                             x + 22 - sp // 2 - 1, y - 1, fill="#ffd000", outline="#ff6a00")
+            c.create_oval(x + 8, y + 16, x + 15, y + 24, fill="white", outline="")
+            c.create_oval(x + 18, y + 16, x + 25, y + 24, fill="white", outline="")
+            c.create_oval(x + 10, y + 18, x + 13, y + 23, fill="black", outline="")
+            c.create_oval(x + 20, y + 18, x + 23, y + 23, fill="black", outline="")
+        elif k == "ghost":
+            body = "#eeeeff"
+            c.create_oval(x, y, x + 30, y + 24, fill=body, outline="#8888cc")
+            c.create_polygon(x, y + 12, x, y + 30, x + 7, y + 24, x + 15, y + 30,
+                             x + 23, y + 24, x + 30, y + 30, x + 30, y + 12,
+                             fill=body, outline="#8888cc")
+            if e.chasing:
+                c.create_oval(x + 6, y + 7, x + 13, y + 15, fill="black", outline="")
+                c.create_oval(x + 17, y + 7, x + 24, y + 15, fill="black", outline="")
+                c.create_oval(x + 9, y + 17, x + 21, y + 26, fill="#331144", outline="")
+            else:                                           # utangaç: elleriyle yüzünü kapatır
+                c.create_oval(x + 3, y + 6, x + 15, y + 17, fill="#cfcff0", outline="#8888cc")
+                c.create_oval(x + 15, y + 6, x + 27, y + 17, fill="#cfcff0", outline="#8888cc")
+        elif k == "lavaball":
+            if e.state != "fly" or e.y > H + 30:
+                return
+            tail = 1 if e.vy < 0 else -1
+            c.create_polygon(x + 5, y + 13 + tail * 8, x + 13, y + 13 + tail * 30,
+                             x + 21, y + 13 + tail * 8, fill="#ff9a00", outline="")
+            c.create_oval(x - 6, y - 6, x + 32, y + 32, fill="#7a2000", outline="")
+            c.create_oval(x, y, x + 26, y + 26, fill="#ff6a00", outline="#ffb000", width=2)
+            c.create_oval(x + 6, y + 6, x + 20, y + 20, fill="#ffe060", outline="")
+
+    def _eyes(self, x, y):
+        c = self.canvas
+        c.create_oval(x + 6, y, x + 14, y + 10, fill="white", outline="")
+        c.create_oval(x + 18, y, x + 26, y + 10, fill="white", outline="")
+        c.create_oval(x + 9, y + 3, x + 13, y + 9, fill="black", outline="")
+        c.create_oval(x + 19, y + 3, x + 23, y + 9, fill="black", outline="")
+
+    def overlay(self, text, sub=""):
+        c = self.canvas
+        c.create_rectangle(0, H / 2 - 70, W, H / 2 + 70, fill="#0b0b1e", outline="#ffffff", width=2)
+        c.create_text(W / 2, H / 2 - 15, text=text, fill="white", font=("Arial", 30, "bold"))
+        if sub:
+            c.create_text(W / 2, H / 2 + 30, text=sub, fill="#dddddd", font=("Arial", 13))
+
+    def draw_world(self):
+        c = self.canvas
+        self.draw_background()
+        for e in self.enemies:                              # bitkiler borunun arkasında
+            if e.kind == "plant":
+                self.draw_plant(e)
+
+        cam = int(self.cam)
+        first = cam // TILE
+        for col in range(first, min(self.cols, first + W // TILE + 2)):
+            sx = col * TILE - cam
+            for row in range(ROWS):
+                ch = self.grid[row][col]
+                if ch == ".":
+                    continue
+                sy = row * TILE
+                if ch == "o":
+                    self.draw_coin(sx, sy, col)
+                    continue
+                if ch == "F":
+                    self.draw_flag(sx, sy, row)
+                    continue
+                f = self.bumped.get((col, row))
+                if f:                                   # kafa vurulan blok zıplar
+                    sy -= round(9 * math.sin(math.pi * (BUMP_FRAMES - f) / BUMP_FRAMES))
+                img, dy = self.get_tile(ch, row, col)
+                c.create_image(sx, sy + dy, image=img, anchor="nw")
+
+        self.draw_checkpoints()
+        for e in self.enemies:
+            self.draw_enemy(e)
+
+        multi = len(self.players) > 1
+        for pl in self.players:
+            if pl.out or pl.dead_t > 0:
+                continue
+            if pl.invuln > 0 and (pl.invuln // 4) % 2 == 0:
+                continue
+            step = 3 if (abs(pl.vx) > 0.5 and pl.on_ground and (self.frame // 6) % 2) else 0
+            px, py = int(pl.x - self.cam), int(pl.y)
+            draw_mario(c, px, py, pl.face, resolve_look(self.equipped_of(pl.idx)), 1.0, step)
+            if multi:
+                c.create_text(px + 14, py - 12, text=str(pl.idx + 1),
+                              fill="white" if pl.idx == 0 else "#9dff9d",
+                              font=("Arial", 11, "bold"))
+
+        for x, y, vx, vy, life in self.particles:       # toz bulutları
+            r = 2 + 3 * life / 18
+            c.create_oval(x - self.cam - r, y - r, x - self.cam + r, y + r,
+                          fill="#e6dccb", outline="")
+        for text, wx, wy, life, col in self.popups:
+            c.create_text(wx - self.cam, wy, text=text, fill=col, font=("Arial", 14, "bold"))
+
+        y0 = 10
+        for pl in self.players:
+            tag = f"{pl.idx + 1}P " if multi else ""
+            hud = f"{tag}PUAN {pl.score:06d}  C x{pl.coins:02d}  CAN x{max(pl.lives, 0)}"
+            col = "white" if pl.idx == 0 else "#9dff9d"
+            c.create_text(12, y0 + 2, text=hud, anchor="nw", fill="black", font=("Courier", 14, "bold"))
+            c.create_text(10, y0, text=hud, anchor="nw", fill=col, font=("Courier", 14, "bold"))
+            y0 += 20
+        snd_on = self.snd.enabled and self.snd.engine
+        info = f"XP {self.save['xp']}  ·  {self.diff['name']}  ·  " + ("♪ açık" if snd_on else "♪ KAPALI")
+        c.create_text(W - 9, 11, text=self.spec["name"], anchor="ne", fill="black", font=("Arial", 12, "bold"))
+        c.create_text(W - 10, 10, text=self.spec["name"], anchor="ne", fill="white", font=("Arial", 12, "bold"))
+        c.create_text(W - 9, 31, text=info, anchor="ne", fill="black", font=("Arial", 11, "bold"))
+        c.create_text(W - 10, 30, text=info, anchor="ne", fill="#7df9ff", font=("Arial", 11, "bold"))
+
+        if self.snd.enabled and self.snd.error:
+            c.create_text(W / 2, H - 10, text=f"Ses hatası: {self.snd.error[:70]}  (S > Ses sihirbazı)",
+                          fill="#ff8080", font=("Arial", 9, "bold"))
+        if self.state == "play" and not multi:
+            pl = self.players[0]
+            if pl.dead_t > 0 and not pl.out:
+                self.overlay("Öldün!", f"Kalan can: {pl.lives}")
+        if self.state == "pause":
+            self.overlay("DURAKLADI", "P: devam   S: ayarlar   R: yeniden başla   ESC: menü")
+        elif self.state == "over":
+            self.overlay("OYUN BİTTİ",
+                         "ENTER: tekrar dene   K: özelleştir   S: ayarlar   ESC: menü")
+        elif self.state == "levelwin":
+            last = self.level_idx + 1 >= len(LEVELS)
+            title = "TÜM BÖLÜMLER BİTTİ!  ★" if last else "BÖLÜM TAMAM!  ★"
+            nxt = "ENTER: menüye dön" if last else "ENTER: sonraki bölüm"
+            scores = "   ".join((f"{p.idx + 1}P: {p.score}" if multi else f"Puan: {p.score}")
+                               for p in self.players)
+            self.overlay(title, f"{scores}   —   {nxt}   K: özelleştir")
+
+    # ---- çizim: menü
+    def draw_menu(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, W, H, fill="#5c94fc", outline="")
+        for cx, cy in ((90, 30), (560, 20), (690, 60)):
+            for dx, dw in ((0, 60), (30, 70), (60, 60)):
+                c.create_oval(cx + dx, cy, cx + dx + dw, cy + 34, fill="white", outline="")
+        c.create_rectangle(0, 400, W, H, fill="#b8601f", outline="#6b2d0e")
+        c.create_rectangle(0, 400, W, 412, fill="#3fc83f", outline="#1d7a1d")
+        c.create_text(W / 2 + 3, 43, text="MİNİ MARİO", font=("Arial", 40, "bold"), fill="black")
+        c.create_text(W / 2, 40, text="MİNİ MARİO", font=("Arial", 40, "bold"), fill="#e02020")
+        c.create_text(W / 2, 88, text="BÖLÜM SEÇ", font=("Arial", 13, "bold"), fill="#fff3a0")
+        if self.snd.error or not self.snd.engine:           # sadece gerçekten ses sorunu varsa göster
+            c.create_text(10, 8, text="♪ Ses sorunu var → AYARLAR → Ses sihirbazı", anchor="nw",
+                          font=("Arial", 10, "bold"), fill="#fff3a0")
+
+        for i, spec in enumerate(LEVELS):                   # bölüm kartları
+            x1, y1, x2, y2 = card_rect(i)
+            th = THEMES[spec["theme"]]
+            sel = i == self.sel_level
+            c.create_rectangle(x1, y1, x2, y2, fill=th["sky"],
+                               outline="#ffeb3b" if sel else "#222222", width=5 if sel else 2)
+            c.create_rectangle(x1 + 3, y2 - 18, x2 - 3, y2 - 3, fill=th["ground"], outline="")
+            c.create_rectangle(x1 + 3, y2 - 18, x2 - 3, y2 - 12, fill=th["top"], outline="")
+            num, nm = spec["name"].split("  ")
+            light = spec["theme"] in ("kar", "col", "gunduz")
+            tcol = "#12304a" if spec["theme"] == "kar" else ("#4a2a00" if spec["theme"] == "col" else "white")
+            c.create_text((x1 + x2) / 2, y1 + 24, text=num, font=("Arial", 22, "bold"), fill=tcol)
+            c.create_text((x1 + x2) / 2, y1 + 50, text=nm, font=("Arial", 11, "bold"), fill=tcol)
+
+        n = self.settings["players"]
+        c.create_text(W / 2, 300,
+                      text=f"Mod: {n} Oyuncu     Zorluk: {DIFFICULTIES[self.settings['difficulty']]['name']}"
+                           f"     XP: {self.save['xp']}",
+                      font=("Arial", 12, "bold"), fill="white")
+        s = 2.4
+        xs = [W / 2 - 14 * s] if n == 1 else [W / 2 - 90, W / 2 + 22]
+        for i, mx in enumerate(xs):
+            draw_mario(c, mx, 400 - 36 * s, 1, resolve_look(self.equipped_of(i)), s)
+        for i, (name, label, key, col) in enumerate(MENU_BUTTONS):
+            x1, y1, x2, y2 = button_rect(i)
+            c.create_rectangle(x1 + 3, y1 + 3, x2 + 3, y2 + 3, fill="#4a2208", outline="")
+            c.create_rectangle(x1, y1, x2, y2, fill=col, outline="#ffffff", width=2)
+            c.create_text((x1 + x2) / 2, (y1 + y2) / 2 - 5, text=label,
+                          font=("Arial", 14, "bold"), fill="white")
+            c.create_text((x1 + x2) / 2, y2 - 8, text=f"[{key}]", font=("Arial", 8, "bold"), fill="#f0f0f0")
+
+    # ---- çizim: kontroller
+    def draw_controls(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, W, H, fill="#1b1b3a", outline="")
+        c.create_text(W / 2, 30, text="KONTROLLER", font=("Arial", 24, "bold"), fill="white")
+        rows = [
+            ("H", "TEK OYUNCU"),
+            ("T", "Yürü: ◀ ▶ veya A D          Koş: Shift (ya da X / Z)"),
+            ("T", "Zıpla: Boşluk, ▲ veya W      Havada tekrar bas = ÇİFT ZIPLAMA"),
+            ("H", "İKİ OYUNCU (ortak ekran)"),
+            ("T", "1. oyuncu:  A D yürü  ·  W veya Boşluk zıpla  ·  Sol Shift koş"),
+            ("T", "2. oyuncu:  ◀ ▶ yürü  ·  ▲ zıpla  ·  Sağ Shift (veya Sağ Ctrl) koş"),
+            ("H", "MENÜ"),
+            ("T", "Bölüm seç: ◀ ▶ ▲ ▼, 1-7 tuşları ya da fareyle tıkla"),
+            ("T", "ENTER başla  ·  K özelleştir (TAB: oyuncu 1/2)  ·  S ayarlar  ·  P 1/2 oyuncu"),
+            ("H", "OYUN SIRASINDA"),
+            ("T", "P duraklat  ·  R bölümü yeniden başlat  ·  ESC ana menü"),
+            ("T", "M sesi aç / kapat  ·  F11 tam ekran"),
+            ("H", "İPUÇLARI"),
+            ("T", "'?' kutularına kafanla vur: hediye XP çıkar, XP ile Mario'yu özelleştir."),
+            ("T", "Dikenli, Etobur Bitki, Hayalet ve Lav Topu'nun üstüne basılmaz."),
+            ("T", "Hayalet sana bakarken donar. Bomba'nın üstüne basarsan etkisiz kalır."),
+        ]
+        y = 62
+        for kind, text in rows:
+            if kind == "H":
+                y += 6
+                c.create_text(60, y, text=text, anchor="w", font=("Arial", 12, "bold"), fill="#ffd966")
+                y += 20
+            else:
+                c.create_text(76, y, text=text, anchor="w", font=("Arial", 11), fill="white")
+                y += 21
+        c.create_text(W / 2, 466, text="ESC / ENTER: geri", font=("Arial", 10), fill="#8888bb")
+
+    # ---- çizim: ayarlar
+    def draw_settings(self):
+        c = self.canvas
+        st = self.settings
+        c.create_rectangle(0, 0, W, H, fill="#1b1b3a", outline="")
+        c.create_text(W / 2, 34, text="AYARLAR", font=("Arial", 26, "bold"), fill="white")
+        labels = {"sound": "Ses", "volume": "Ses seviyesi", "engine": "Ses motoru",
+                  "test": "Sesi dene", "wizard": "Ses sihirbazı (ses gelmiyorsa)", "difficulty": "Zorluk", "players": "Oyuncu sayısı",
+                  "fullscreen": "Tam ekran  (F11)", "fsmode": "Tam ekran görüntüsü",
+                  "controls": "Kontroller", "back": "Geri dön"}
+        for i, name in enumerate(SETTINGS_ROWS):
+            y = 64 + i * 30
+            sel = i == self.set_row
+            c.create_rectangle(100, y - 13, 700, y + 13, fill="#33336a" if sel else "#25254d",
+                               outline="#ffeb3b" if sel else "#44448a", width=3 if sel else 1)
+            c.create_text(125, y, text=labels[name], anchor="w", font=("Arial", 13, "bold"), fill="white")
+            vx = 560
+            if name == "sound":
+                on = st["sound"]
+                c.create_text(vx, y, text="◀  AÇIK  ▶" if on else "◀  KAPALI  ▶",
+                              font=("Arial", 13, "bold"), fill="#6dff6d" if on else "#ff8080")
+            elif name == "volume":
+                for j in range(10):
+                    c.create_rectangle(430 + j * 17, y - 9, 443 + j * 17, y + 9,
+                                       fill="#7df9ff" if j < st["volume"] // 10 else "#444477", outline="")
+                c.create_text(675, y, text=f"{st['volume']}%", anchor="e",
+                              font=("Arial", 12, "bold"), fill="white")
+            elif name == "engine":
+                if st["engine"] == "auto":
+                    cur = ENGINE_LABELS.get(self.snd.engine, "yok") if self.snd.engine else "yok"
+                    txt = f"◀ Otomatik ({cur}) ▶"
+                else:
+                    txt = f"◀ {ENGINE_LABELS.get(st['engine'], st['engine'])} ▶"
+                c.create_text(vx, y, text=txt, font=("Arial", 11, "bold"), fill="#ffd966")
+            elif name == "test":
+                c.create_text(vx, y, text="[ENTER]  çal", font=("Arial", 12, "bold"), fill="#ffd966")
+            elif name == "wizard":
+                c.create_text(vx, y, text="[ENTER]  başlat", font=("Arial", 12, "bold"), fill="#ffd966")
+            elif name == "difficulty":
+                c.create_text(vx, y, text=f"◀  {DIFFICULTIES[st['difficulty']]['name']}  ▶",
+                              font=("Arial", 13, "bold"), fill="#ffd966")
+            elif name == "players":
+                c.create_text(vx, y, text=f"◀  {st['players']} Oyuncu  ▶",
+                              font=("Arial", 13, "bold"), fill="#ffd966")
+            elif name == "fullscreen":
+                on = self.fullscreen
+                c.create_text(vx, y, text="◀  AÇIK  ▶" if on else "◀  KAPALI  ▶",
+                              font=("Arial", 13, "bold"), fill="#6dff6d" if on else "#ffd966")
+            elif name == "fsmode":
+                crisp = st["fs_crisp"]
+                c.create_text(vx, y, text="◀  Keskin (tam sayı)  ▶" if crisp else "◀  Doldur  ▶",
+                              font=("Arial", 12, "bold"), fill="#ffd966")
+            elif name == "controls":
+                c.create_text(vx, y, text="[ENTER]  göster", font=("Arial", 12, "bold"), fill="#ffd966")
+            elif name == "back":
+                c.create_text(vx, y, text="[ENTER / ESC]", font=("Arial", 12, "bold"), fill="#ffd966")
+
+        d = DIFFICULTIES[st["difficulty"]]
+        c.create_text(W / 2, 398,
+                      text=f"{d['name']}: {d['lives']} can, canavar hızı x{d['speed']}, XP x{d['xp']}"
+                           "   (Zorluk/oyuncu sayısı bölüm başlayınca geçerli olur)",
+                      font=("Arial", 10), fill="#aaaadd")
+        ok, text = self.snd.status()
+        c.create_text(W / 2, 418, text="Ses durumu: " + text, font=("Arial", 10, "bold"),
+                      fill="#6dff6d" if ok else "#ff8080")
+        folder = self.snd.folder or "-"
+        if len(folder) > 70:
+            folder = "…" + folder[-69:]
+        c.create_text(W / 2, 436, text="Ses dosyaları: " + folder, font=("Arial", 9), fill="#8888bb")
+        c.create_text(W / 2, 454, text="Ses gelmiyorsa 'Ses sihirbazı'nı çalıştır.   ▲▼ ◀▶ ENTER ESC",
+                      font=("Arial", 9), fill="#8888bb")
+
+    # ---- çizim: dükkan
+    def draw_shop(self):
+        c = self.canvas
+        c.create_rectangle(0, 0, W, H, fill="#1b1b3a", outline="")
+        c.create_text(20, 14, text="MARİO'YU ÖZELLEŞTİR", anchor="nw",
+                      font=("Arial", 20, "bold"), fill="white")
+        c.create_text(W - 20, 16, text=f"XP: {self.save['xp']}", anchor="ne",
+                      font=("Arial", 18, "bold"), fill="#7df9ff")
+        pcol = "white" if self.shop_player == 0 else "#9dff9d"
+        c.create_text(W - 20, 48, text=f"TAB: oyuncu değiştir  —  şu an OYUNCU {self.shop_player + 1}",
+                      anchor="ne", font=("Arial", 11, "bold"), fill=pcol)
+
+        # Önizleme (seçili seçenek anında denenir)
+        base = self.equipped_of(self.shop_player)
+        eq = {"hat": base["hat"], "overall": base["overall"], "boots": base["boots"],
+              "acc": list(base["acc"])}
+        key, _, opts = CATS[self.shop_row]
+        oid = opts[self.shop_col[self.shop_row]][0]
+        if key == "acc":
+            if oid not in eq["acc"]:
+                eq["acc"] = (eq["acc"] + [oid])[-MAX_ACC:]
+        else:
+            eq[key] = oid
+        c.create_rectangle(25, 80, 250, 430, fill="#2a2a55", outline="#6666aa", width=2)
+        c.create_text(137, 100, text=f"OYUNCU {self.shop_player + 1}", font=("Arial", 12, "bold"), fill=pcol)
+        c.create_oval(65, 285, 210, 305, fill="#1a1a33", outline="")
+        step = 3 if (self.frame // 12) % 2 else 0
+        draw_mario(c, 137 - 14 * 3.2, 170, 1, resolve_look(eq), 3.2, step)
+        c.create_text(137, 335, text=opts[self.shop_col[self.shop_row]][1],
+                      font=("Arial", 14, "bold"), fill="white")
+        c.create_text(137, 358, text=CATS[self.shop_row][1].split("  ")[0],
+                      font=("Arial", 9), fill="#aaaadd")
+
+        # Seçenek kutuları (4 satır)
+        for i, (ckey, label, copts) in enumerate(CATS):
+            top = 98 + i * 88
+            c.create_text(275, top - 4, text=label, anchor="sw",
+                          font=("Arial", 11, "bold"), fill="#ffd966")
+            for j, (oid2, name, col, cost) in enumerate(copts):
+                x = 275 + j * 82
+                owned = f"{ckey}:{oid2}" in self.save["owned"]
+                if ckey == "acc":
+                    equipped = oid2 in base["acc"]
+                else:
+                    equipped = base[ckey] == oid2
+                selected = (i == self.shop_row and j == self.shop_col[i])
+                c.create_rectangle(x, top, x + 76, top + 66, fill="#33336a",
+                                   outline="#ffeb3b" if selected else "#5555aa",
+                                   width=4 if selected else 2)
+                if col:
+                    c.create_rectangle(x + 18, top + 6, x + 58, top + 30, fill=col, outline="white")
+                    c.create_text(x + 38, top + 41, text=name, font=("Arial", 9, "bold"), fill="white")
+                    sy = top + 56
+                else:
+                    c.create_text(x + 38, top + 22, text=name, font=("Arial", 11, "bold"), fill="white")
+                    sy = top + 50
+                if equipped:
+                    c.create_text(x + 38, sy, text="✔ TAKILI" if ckey == "acc" else "✔ SEÇİLİ",
+                                  font=("Arial", 9, "bold"), fill="#6dff6d")
+                elif owned:
+                    c.create_text(x + 38, sy, text="Sende", font=("Arial", 9), fill="#cccccc")
+                else:
+                    afford = self.save["xp"] >= cost
+                    c.create_text(x + 38, sy, text=f"{cost} XP", font=("Arial", 10, "bold"),
+                                  fill="#7df9ff" if afford else "#ff7777")
+
+        if self.shop_msg_t > 0:
+            c.create_text(W / 2 + 100, 452, text=self.shop_msg, font=("Arial", 12, "bold"), fill="#ffeb3b")
+        c.create_text(20, 470, text="▲▼ ◀▶: gez   ENTER: satın al / tak-çıkar   TAB: oyuncu   ESC: geri",
+                      anchor="w", font=("Arial", 10), fill="#aaaadd")
+
+    def draw(self):
+        self.canvas.delete("all")
+        if self.state == "menu":
+            self.draw_menu()
+        elif self.state == "settings":
+            self.draw_settings()
+        elif self.state == "wizard":
+            self.draw_wizard()
+        elif self.state == "controls":
+            self.draw_controls()
+        elif self.state == "shop":
+            self.draw_shop()
+        else:
+            self.draw_world()
+        if self.toast_t > 0:
+            self.canvas.create_text(W / 2, 62, text=self.toast, fill="white",
+                                    font=("Arial", 14, "bold"))
+        self.canvas.letterbox()
+
+    def tick(self):
+        """Sabit zaman adımı: çizim yavaşlasa (tam ekran) bile oyun hızı değişmez."""
+        t0 = time.perf_counter()
+        self.acc = min(self.acc + (t0 - self.last_t), 0.1)
+        self.last_t = t0
+        steps = 0
+        while self.acc >= STEP and steps < 4:
+            self.update()
+            self.acc -= STEP
+            steps += 1
+        if steps:
+            self.draw()
+        spent = int((time.perf_counter() - t0) * 1000)
+        self.root.after(max(1, FRAME_MS - spent), self.tick)
+
+
+def main():
+    root = tk.Tk()
+    root.title("Mini Mario - Python 3.13")
+    root.resizable(False, False)
+    Game(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
